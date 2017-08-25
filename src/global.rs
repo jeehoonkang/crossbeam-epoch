@@ -6,17 +6,10 @@
 //!
 //! `registries` is the list is the registered mutators, and `epoch` is the global epoch.
 
-use std::cmp;
-use std::sync::atomic::Ordering::{Relaxed, SeqCst};
 use mutator::{Mutator, LocalEpoch, Scope, unprotected_with_bag};
-use garbage::Bag;
+use garbage::{Bag, Dumpster};
 use epoch::Epoch;
 use sync::michael_list::List;
-use sync::ms_queue::Queue;
-
-
-/// Number of bags to destroy.
-const COLLECT_STEPS: usize = 8;
 
 
 // FIXME(jeehoonkang): accessing globals in `lazy_static!` is blocking.
@@ -27,42 +20,24 @@ const COLLECT_STEPS: usize = 8;
 lazy_static! {
     /// REGISTRIES is the head pointer of the list of mutator registries.
     pub static ref REGISTRIES: List<LocalEpoch> = List::new();
-    /// GARBAGES is a reference to the global queue of garbages.
-    pub static ref GARBAGES: Queue<(usize, Bag)> = Queue::new();
+    /// DUMPSTER is a reference to the global dumpster of garbages.
+    pub static ref DUMPSTER: Dumpster = Dumpster::new();
     /// EPOCH is a reference to the global epoch.
     pub static ref EPOCH: Epoch = Epoch::new();
 }
 
 
-/// Pushes the bag onto the global queue and replaces the bag with a new empty bag.
+/// Dumps the bag onto the global queue and replaces the bag with a new empty bag.
 #[inline]
-pub fn push_bag<'scope>(bag: &mut Bag, scope: &'scope Scope) {
-    let epoch = EPOCH.load(Relaxed);
-    let bag = ::std::mem::replace(bag, Bag::new());
-    ::std::sync::atomic::fence(SeqCst);
-    GARBAGES.push((epoch, bag), scope);
+pub fn dump(bag: &mut Bag, scope: &Scope) {
+    DUMPSTER.dump(bag, scope)
 }
 
 /// Collect several bags from the global old garbage queue and destroys their objects.
 ///
 /// Note: This may itself produce garbage and in turn allocate new bags.
 pub fn collect(scope: &Scope) {
-    let epoch = EPOCH.try_advance(&REGISTRIES, scope);
-
-    let condition = |bag: &(usize, Bag)| {
-        // A pinned thread can witness at most one epoch advancement. Therefore, any bag that is
-        // within one epoch of the current one cannot be destroyed yet.
-        let diff = epoch.wrapping_sub(bag.0);
-        cmp::min(diff, 0usize.wrapping_sub(diff)) > 2
-    };
-
-    let garbages = &GARBAGES;
-    for _ in 0..COLLECT_STEPS {
-        match garbages.try_pop_if(&condition, scope) {
-            None => break,
-            Some(bag) => drop(bag),
-        }
-    }
+    DUMPSTER.collect(scope)
 }
 
 

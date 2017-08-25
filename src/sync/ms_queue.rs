@@ -31,6 +31,12 @@ unsafe impl<T: Send> Sync for Queue<T> {}
 unsafe impl<T: Send> Send for Queue<T> {}
 
 
+impl<T> Default for Queue<T> {
+    fn default() -> Queue<T> {
+        Self::new()
+    }
+}
+
 impl<T> Queue<T> {
     /// Create a new, empty queue.
     pub fn new() -> Queue<T> {
@@ -53,82 +59,39 @@ impl<T> Queue<T> {
     }
 
     #[inline(always)]
-    /// Attempt to atomically place `n` into the `next` pointer of `onto`.
-    ///
-    /// If unsuccessful, returns ownership of `n`, possibly updating
-    /// the queue's `tail` pointer.
-    fn push_internal(
-        &self,
-        onto: Ptr<Node<T>>,
-        new: Owned<Node<T>>,
-        scope: &Scope,
-    ) -> Result<(), Owned<Node<T>>> {
-        // is `onto` the actual tail?
-        let o = unsafe { onto.deref() };
-        let next = o.next.load(Acquire, scope);
-        if unsafe { next.as_ref().is_some() } {
-            // if not, try to "help" by moving the tail pointer forward
-            let _ = self.tail.compare_and_set(onto, next, Release, scope);
-            Err(new)
-        } else {
-            // looks like the actual tail; attempt to link in `n`
-            o.next
-                .compare_and_set_owned(Ptr::null(), new, Release, scope)
-                .map(|new| {
-                    // try to move the tail pointer forward
-                    let _ = self.tail.compare_and_set(onto, new, Release, scope);
-                })
-                .map_err(|(_, new)| new)
+    /// Atomically place `new_head` into the `next` pointer of `self.tail`, and try to assign
+    /// `new_tail` to `self.tail`.
+    fn push_internal(&self, new_head: Ptr<Node<T>>, new_tail: Ptr<Node<T>>, scope: &Scope) {
+        loop {
+            // We push onto the tail, so we'll start optimistically by looking there first.
+            let tail = self.tail.load(Acquire, scope);
+
+            // is `tail` the actual tail?
+            let t = unsafe { tail.deref() };
+            let next = t.next.load(Acquire, scope);
+            if unsafe { next.as_ref().is_some() } {
+                // if not, try to "help" by moving the tail pointer forward, and retry.
+                let _ = self.tail.compare_and_set(tail, next, Release, scope);
+            } else {
+                // looks like the actual tail; attempt to link in `n`
+                if t.next.compare_and_set(Ptr::null(), new_head, Release, scope).is_ok() {
+                    // `new` is successfully pushed. Try to move the tail pointer forward.
+                    let _ = self.tail.compare_and_set(tail, new_tail, Release, scope);
+                    break;
+                }
+            }
         }
     }
 
     /// Add `t` to the back of the queue, possibly waking up threads
     /// blocked on `pop`.
     pub fn push(&self, t: T, scope: &Scope) {
-        let mut new = Owned::new(Node {
+        let new = Owned::new(Node {
             data: t,
             next: Atomic::null(),
         });
-
-        loop {
-            // We push onto the tail, so we'll start optimistically by looking
-            // there first.
-            let tail = self.tail.load(Acquire, scope);
-
-            // Attempt to push onto the `tail` snapshot; fails if
-            // `tail.next` has changed, which will always be the case if the
-            // queue has transitioned to blocking mode.
-            match self.push_internal(tail, new, scope) {
-                Ok(_) => break,
-                Err(temp) => {
-                    // retry
-                    new = temp
-                }
-            }
-        }
-    }
-
-    #[inline(always)]
-    // Attempt to pop a data node. `Ok(None)` if queue is empty or in blocking
-    // mode; `Err(())` if lost race to pop.
-    fn pop_internal(&self, scope: &Scope) -> Result<Option<T>, ()> {
-        let head = self.head.load(Acquire, scope);
-        let h = unsafe { head.deref() };
-        let next = h.next.load(Acquire, scope);
-        match unsafe { next.as_ref() } {
-            None => Ok(None),
-            Some(n) => unsafe {
-                if self.head
-                    .compare_and_set(head, next, Release, scope)
-                    .is_ok()
-                {
-                    scope.defer_free(head);
-                    Ok(Some(ptr::read(&n.data)))
-                } else {
-                    Err(())
-                }
-            },
-        }
+        let new = Owned::into_ptr(new, scope);
+        self.push_internal(new, new, scope);
     }
 
     /// Check if this queue is empty.
@@ -145,35 +108,55 @@ impl<T> Queue<T> {
     /// Returns `None` if the queue is observed to be empty.
     pub fn try_pop(&self, scope: &Scope) -> Option<T> {
         loop {
-            if let Ok(r) = self.pop_internal(scope) {
-                return r;
+            let head = self.head.load(Acquire, scope);
+            let h = unsafe { head.deref() };
+            let next = h.next.load(Acquire, scope);
+            match unsafe { next.as_ref() } {
+                None => {
+                    return None;
+                },
+                Some(n) => unsafe {
+                    if self.head
+                        .compare_and_set(head, next, Release, scope)
+                        .is_ok()
+                    {
+                        scope.defer_free(head);
+                        return Some(ptr::read(&n.data));
+                    }
+
+                    // We lost the race. Try again.
+                },
             }
         }
     }
 
-    /// Attempt to dequeue from the front, if the item satisfies the given condition.
-    ///
-    /// Returns `None` if the queue is observed to be empty, or the head does not satisfy the given
-    /// condition.
-    pub fn try_pop_if<F>(&self, condition: F, scope: &Scope) -> Option<T>
-    where
-        F: Fn(&T) -> bool,
-    {
-        loop {
-            if let Ok(head) = self.pop_internal(scope) {
-                match head {
-                    None => return None,
-                    Some(h) => {
-                        if condition(&h) {
-                            return Some(h);
-                        } else {
-                            mem::forget(h);
-                            return None;
-                        }
-                    }
-                }
-            }
-        }
+    pub fn swap(&self, new: &mut Self, scope: &Scope) {
+        let head = new.head.load(Relaxed, scope);
+        let tail = new.tail.load(Relaxed, scope);
+        ::std::sync::atomic::fence(Release);
+
+        let head = self.head.swap(head, Relaxed, scope);
+        let tail = self.tail.swap(tail, Relaxed, scope);
+        ::std::sync::atomic::fence(Acquire);
+        
+        new.head.store(head, Relaxed);
+        new.tail.store(tail, Relaxed);
+    }
+
+    pub fn append(&self, other: &Self, scope: &Scope) {
+        // replace `other` with a new queue.
+        let mut new = Self::new();
+        other.swap(&mut new, scope);
+
+        // get the `head` and `tail` of `other` at the beginning.
+        let head = new.head.load(Relaxed, scope);
+        let tail = new.tail.load(Relaxed, scope);
+
+        // push `head` at the tail of the queue.
+        self.push_internal(head, tail, scope);
+
+        // Forget `new`, since the ownership of `new.head` and `new.tail` is transferred to `self.
+        mem::forget(new);
     }
 }
 

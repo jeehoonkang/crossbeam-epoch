@@ -157,7 +157,7 @@ impl<'scope> Drop for Mutator<'scope> {
 
             // Push the local bag into the global garbage queue.
             unsafe {
-                global::push_bag(&mut *self.bag.get(), scope);
+                global::dump(&mut *self.bag.get(), scope);
             }
         });
     }
@@ -234,7 +234,7 @@ impl Scope {
         let bag = self.get_bag();
 
         while let Err(g) = bag.try_push(garbage) {
-            global::push_bag(bag, self);
+            global::dump(bag, self);
             garbage = g;
         }
     }
@@ -277,7 +277,7 @@ impl Scope {
         unsafe {
             let bag = self.get_bag();
             if !bag.is_empty() {
-                global::push_bag(bag, self);
+                global::dump(bag, self);
             }
         }
 

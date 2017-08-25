@@ -32,9 +32,9 @@ impl Epoch {
     /// The global epoch can advance only if all currently pinned mutators have been pinned in the
     /// current epoch.
     ///
-    /// Returns the current global epoch.
+    /// Returns the current global epoch, and whether the global epoch is advanced.
     #[cold]
-    pub fn try_advance<'scope>(&self, registries: &List<LocalEpoch>, scope: &Scope) -> usize {
+    pub fn try_advance<'scope>(&self, registries: &List<LocalEpoch>, scope: &Scope) -> (usize, bool) {
         let epoch = self.epoch.load(Relaxed);
         ::std::sync::atomic::fence(SeqCst);
 
@@ -45,7 +45,7 @@ impl Epoch {
                 IterResult::Abort => {
                     // We leave the job to the mutator that also tries to advance to epoch and
                     // continues to iterate the registries.
-                    return epoch;
+                    return (epoch, false);
                 }
                 IterResult::None => break,
                 IterResult::Some(local_epoch) => {
@@ -54,7 +54,7 @@ impl Epoch {
                     // If the mutator was pinned in a different epoch, we cannot advance the global
                     // epoch just yet.
                     if mutator_is_pinned && mutator_epoch != epoch {
-                        return epoch;
+                        return (epoch, false);
                     }
                 }
             }
@@ -65,7 +65,7 @@ impl Epoch {
         // increment by 2 and simply wrap around on overflow.
         let epoch_new = epoch.wrapping_add(2);
         self.epoch.store(epoch_new, Release);
-        epoch_new
+        (epoch_new, true)
     }
 }
 

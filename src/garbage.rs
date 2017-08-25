@@ -24,14 +24,22 @@
 //! dropped.
 
 use std::mem;
+use std::sync::atomic::Ordering::{Relaxed, SeqCst};
 use boxfnonce::SendBoxFnOnce;
 use arrayvec::ArrayVec;
+use mutator::Scope;
+use global::{EPOCH, REGISTRIES};
+use sync::ms_queue::Queue;
+
 
 /// Maximum number of objects a bag can contain.
 #[cfg(not(feature = "strict_gc"))]
 const MAX_OBJECTS: usize = 64;
 #[cfg(feature = "strict_gc")]
 const MAX_OBJECTS: usize = 4;
+
+/// Number of bags to destroy.
+const COLLECT_STEPS: usize = 8;
 
 
 pub enum Garbage {
@@ -137,6 +145,53 @@ impl Bag {
         match self.objects.push(garbage) {
             None => Ok(()),
             Some(g) => Err(g),
+        }
+    }
+}
+
+
+/// Queues of garbages.
+// FIXME(jeehoonkang): is MS queue slow for this purpose?
+#[derive(Default)]
+pub struct Dumpster {
+    purgatory: Queue<Bag>,
+    pending: [Queue<Bag>; 4],
+}
+
+impl Dumpster {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    #[inline]
+    fn idx(epoch: usize) -> usize {
+        (epoch / 2) % 4
+    }
+
+    /// Dumps the bag onto the global queue and replaces the bag with a new empty bag.
+    #[inline]
+    pub fn dump(&self, bag: &mut Bag, scope: &Scope) {
+        let epoch = EPOCH.load(Relaxed);
+        let bag = ::std::mem::replace(bag, Bag::new());
+        ::std::sync::atomic::fence(SeqCst);
+        self.pending[Dumpster::idx(epoch)].push(bag, scope);
+    }
+
+    /// Collect several bags from the global old garbage queue and destroys their objects.
+    ///
+    /// Note: This may itself produce garbage and in turn allocate new bags.
+    pub fn collect(&self, scope: &Scope) {
+        let (epoch, is_advanced) = EPOCH.try_advance(&REGISTRIES, scope);
+        let idx = Dumpster::idx(epoch);
+        if is_advanced {
+            self.purgatory.append(&self.pending[(idx + 2) % 4], scope);
+        }
+
+        for _ in 0..COLLECT_STEPS {
+            match self.purgatory.try_pop(scope) {
+                None => break,
+                Some(bag) => drop(bag),
+            }
         }
     }
 }
