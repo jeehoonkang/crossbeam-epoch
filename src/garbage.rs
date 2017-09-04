@@ -24,6 +24,8 @@
 //! dropped.
 
 use std::mem;
+use std::result::Result;
+use std::fmt::{Debug, Formatter, Error};
 use boxfnonce::SendBoxFnOnce;
 use arrayvec::ArrayVec;
 
@@ -46,6 +48,12 @@ pub enum Garbage {
 
 unsafe impl Sync for Garbage {}
 unsafe impl Send for Garbage {}
+
+impl Debug for Garbage {
+    fn fmt(&self, f: &mut Formatter) -> Result<(), Error> {
+        write!(f, "garbage")
+    }
+}
 
 impl Garbage {
     /// Make a garbage object that will later be destroyed using `destroy`.
@@ -116,7 +124,7 @@ impl Drop for Garbage {
 
 
 /// Bag of garbages.
-#[derive(Default)]
+#[derive(Default, Debug)]
 pub struct Bag {
     /// Removed objects.
     objects: ArrayVec<[Garbage; MAX_OBJECTS]>,

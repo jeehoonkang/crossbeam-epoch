@@ -13,24 +13,38 @@
 //! periodic global epoch advancement.
 //!
 //! When a mutator is pinned, a `EpochScope` is returned as a witness that the mutator is pinned.
-//! EpochScopes are necessary for performing atomic operations, and for freeing/dropping locations.
+//! `EpochScope`s are necessary for performing atomic operations, and for freeing/dropping
+//! locations.
 
 use std::cell::{Cell, UnsafeCell};
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering::{Relaxed, Release, SeqCst};
+use std::marker::PhantomData;
 
-use scope::Scope;
-use sync::list::Node;
 use garbage::{Garbage, Bag};
-use global;
+use realm::{Scope, Realm};
+use sync::list::Node;
 
 
 /// Number of pinnings after which a mutator will collect some global garbage.
 const PINS_BETWEEN_COLLECT: usize = 128;
 
 
+/// An entry in the linked list of the registered mutators.
+#[derive(Default, Debug)]
+pub struct LocalEpoch {
+    /// The least significant bit is set if the mutator is currently pinned. The rest of the bits
+    /// encode the current epoch.
+    state: AtomicUsize,
+}
+
 /// Entity that changes shared locations.
-pub struct Mutator<'scope> {
+pub struct Mutator<'scope, R>
+where
+    R: Realm<'scope>,
+{
+    /// The realm it belongs to.
+    realm: R,
     /// The local garbage objects that will be later freed.
     bag: UnsafeCell<Bag>,
     /// This mutator's entry in the local epoch list.
@@ -41,47 +55,48 @@ pub struct Mutator<'scope> {
     pin_count: Cell<usize>,
 }
 
-/// An entry in the linked list of the registered mutators.
-#[derive(Default, Debug)]
-pub struct LocalEpoch {
-    /// The least significant bit is set if the mutator is currently pinned. The rest of the bits
-    /// encode the current epoch.
-    state: AtomicUsize,
-}
-
 /// A witness that the current mutator is pinned.
 ///
-/// A reference to `EpochScope` is a witness that the current mutator is pinned. Lots of methods
-/// that interact with [`Atomic`]s can safely be called only while the mutator is pinned so they
-/// often require a reference to `EpochScope`.
+/// A reference to `EpochScope` is a witness that the current mutator is pinned. A reference to
+/// `EpochScope` implements [`Scope`], which can be used to interact with [`Atomic`]s.
 ///
 /// This data type is inherently bound to the thread that created it, therefore it does not
 /// implement `Send` nor `Sync`.
 ///
+/// [`Scope`]: trait.Scope.html
 /// [`Atomic`]: struct.Atomic.html
 #[derive(Debug)]
-pub struct EpochScope {
+pub struct EpochScope<'scope, R>
+where
+    R: Realm<'scope>,
+{
+    realm: R,
     bag: *mut Bag, // !Send + !Sync
+    _marker: PhantomData<&'scope Bag>,
 }
 
-/// Unprotected scope.
+/// An unsafe `Scope`.
 ///
-/// In `UnprotectedScope`, the client should guarantee that it is the only one accessing
-/// atomics. Lots of methods that interact with [`Atomic`]s accept `UnprotectedScope` as well as
-/// `&EpochScope`.
+/// See [`unprotected`] for more details.
 ///
-/// [`Atomic`]: struct.Atomic.html
+/// [`unprotected`]: fn.unprotected.html
 #[derive(Debug, Clone, Copy, Default)]
 pub struct UnprotectedScope {}
 
-impl<'scope> Mutator<'scope> {
-    pub fn new() -> Self {
+impl<'scope, R> Mutator<'scope, R>
+where
+    R: Realm<'scope>,
+{
+    /// Create a mutator.
+    pub fn new(realm: R) -> Self {
         Mutator {
+            realm: realm,
             bag: UnsafeCell::new(Bag::new()),
             local_epoch: unsafe {
                 // Since we dereference no pointers in this block, it is safe to call `unprotected`.
                 unprotected(|scope| {
-                    &*global::REGISTRIES
+                    &*realm
+                        .registries()
                         .insert_head(LocalEpoch::new(), scope)
                         .as_raw()
                 })
@@ -93,9 +108,9 @@ impl<'scope> Mutator<'scope> {
 
     /// Pins the current mutator, executes a function, and unpins the mutator.
     ///
-    /// The provided function takes a reference to a `Scope`, which can be used to interact with
-    /// [`Atomic`]s. The scope serves as a proof that whatever data you load from an [`Atomic`] will
-    /// not be concurrently deleted by another mutator while the scope is alive.
+    /// The provided function takes a reference to a [`EpochScope`], which can be used to interact
+    /// with [`Atomic`]s. The scope serves as a proof that whatever data you load from an [`Atomic`]
+    /// will not be concurrently deleted by another mutator while the scope is alive.
     ///
     /// Note that keeping a mutator pinned for a long time prevents memory reclamation of any newly
     /// deleted objects protected by [`Atomic`]s. The provided function should be very quick -
@@ -109,12 +124,17 @@ impl<'scope> Mutator<'scope> {
     /// it can be used pretty liberally. On a modern machine pinning takes 10 to 15 nanoseconds.
     ///
     /// [`Atomic`]: struct.Atomic.html
-    pub fn pin<F, R>(&self, f: F) -> R
+    /// [`EpochScope`]: struct.EpochScope.html
+    pub fn pin<F, V>(&self, f: F) -> V
     where
-        F: FnOnce(&EpochScope) -> R,
+        F: FnOnce(&EpochScope<'scope, R>) -> V,
     {
         let local_epoch = self.local_epoch.get();
-        let scope = &EpochScope { bag: self.bag.get() };
+        let scope = &EpochScope {
+            realm: self.realm,
+            bag: self.bag.get(),
+            _marker: PhantomData,
+        };
 
         let was_pinned = self.is_pinned.get();
         if !was_pinned {
@@ -124,11 +144,12 @@ impl<'scope> Mutator<'scope> {
 
             // Pin the mutator.
             self.is_pinned.set(true);
-            local_epoch.set_pinned();
+            let epoch = self.realm.epoch().load(Relaxed);
+            local_epoch.set_pinned(epoch);
 
             // If the counter progressed enough, try advancing the epoch and collecting garbage.
             if count % PINS_BETWEEN_COLLECT == 0 {
-                global::collect(scope);
+                self.realm.collect(scope);
             }
         }
 
@@ -145,26 +166,32 @@ impl<'scope> Mutator<'scope> {
     }
 
     /// Returns `true` if the current mutator is pinned.
-    pub fn is_pinned(&'scope self) -> bool {
+    pub fn is_pinned<'s>(&'s self) -> bool
+    where
+        'scope: 's,
+    {
         self.is_pinned.get()
     }
 }
 
-impl<'scope> Drop for Mutator<'scope> {
+impl<'scope, R> Drop for Mutator<'scope, R>
+where
+    R: Realm<'scope>,
+{
     fn drop(&mut self) {
         // Now that the mutator is exiting, we must move the local bag into the global garbage
         // queue. Also, let's try advancing the epoch and help free some garbage.
 
         self.pin(|scope| {
             // Spare some cycles on garbage collection.
-            global::collect(scope);
+            self.realm.collect(scope);
 
             // Unregister the mutator by marking this entry as deleted.
             self.local_epoch.delete(scope);
 
             // Push the local bag into the global garbage queue.
             unsafe {
-                global::push_bag(&mut *self.bag.get(), scope);
+                self.realm.push_bag(&mut *self.bag.get(), scope);
             }
         });
     }
@@ -182,7 +209,7 @@ impl<'scope> Drop for Mutator<'scope> {
 /// we access should not be deallocated by concurrent mutators, and (2) the locations that we
 /// deallocate should not be accessed by concurrent mutators.
 ///
-/// Just like with the safe epoch::pin function, unprotected use of atomics is enclosed within a
+/// Just like with the safe `epoch::pin` function, unprotected use of atomics is enclosed within a
 /// scope so that pointers created within it don't leak out or get mixed with pointers from other
 /// scopes.
 ///
@@ -216,8 +243,7 @@ impl LocalEpoch {
     ///
     /// Must not be called if the mutator is already pinned!
     #[inline]
-    pub fn set_pinned(&self) {
-        let epoch = global::EPOCH.load(Relaxed);
+    pub fn set_pinned(&self, epoch: usize) {
         let state = epoch | 1;
 
         // Now we must store `state` into `self.state`. It's important that any succeeding loads
@@ -247,13 +273,11 @@ impl LocalEpoch {
     }
 }
 
-impl EpochScope {
-    unsafe fn get_bag(&self) -> &mut Bag {
-        &mut *self.bag
-    }
-}
-
-impl<'scope> Scope<'scope> for &'scope EpochScope {
+impl<'s, 'scope, R> Scope<'s> for &'s EpochScope<'scope, R>
+where
+    'scope: 's,
+    R: Realm<'scope>,
+{
     /// Deferred disposal of garbage.
     ///
     /// This function inserts the garbage into a mutator-local [`Bag`]. When the bag becomes full,
@@ -261,10 +285,10 @@ impl<'scope> Scope<'scope> for &'scope EpochScope {
     ///
     /// [`Bag`]: struct.Bag.html
     unsafe fn defer_dispose(self, mut garbage: Garbage) {
-        let bag = self.get_bag();
+        let bag = &mut *self.bag;
 
         while let Err(g) = bag.try_push(garbage) {
-            global::push_bag(bag, self);
+            self.realm.push_bag(bag, self);
             garbage = g;
         }
     }
@@ -282,13 +306,13 @@ impl<'scope> Scope<'scope> for &'scope EpochScope {
     /// [`defer_drop`]: fn.defer_drop.html
     fn flush(self) {
         unsafe {
-            let bag = self.get_bag();
+            let bag = &mut *self.bag;
             if !bag.is_empty() {
-                global::push_bag(bag, self);
+                self.realm.push_bag(bag, self);
             }
         }
 
-        global::collect(self);
+        self.realm.collect(self);
     }
 }
 

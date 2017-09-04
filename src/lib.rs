@@ -38,15 +38,15 @@ extern crate arrayvec;
 extern crate boxfnonce;
 extern crate crossbeam_utils;
 
-mod scope;
 mod atomic;
-mod mutator;
 mod garbage;
 mod epoch;
-mod global;
+mod realm;
+mod mutator;
+mod default;
 mod sync;
 
 pub use self::atomic::{Atomic, CompareAndSetOrdering, Owned, Ptr};
-pub use self::global::{pin, is_pinned};
-pub use self::scope::Scope;
-pub use self::mutator::unprotected;
+pub use self::realm::{Scope, Realm, UserRealm};
+pub use self::mutator::{Mutator, unprotected};
+pub use self::default::{DefaultRealm, pin, is_pinned};

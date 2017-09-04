@@ -5,7 +5,7 @@ use std::ops::{Deref, DerefMut};
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 
-use scope::Scope;
+use realm::Scope;
 
 /// Given ordering for the success case in a compare-exchange operation, returns the strongest
 /// appropriate ordering for the failure case.
@@ -90,9 +90,9 @@ fn data_with_tag<T>(data: usize, tag: usize) -> usize {
 /// least significant bits of the address.  More precisely, a tag should be less than `(1 <<
 /// mem::align_of::<T>().trailing_zeros())`.
 ///
-/// Any method that loads the pointer must be passed a reference to a [`Scope`].
+/// Any method that loads the pointer must be passed a [`Scope`].
 ///
-/// [`Scope`]: struct.Scope.html
+/// [`Scope`]: trait.Scope.html
 #[derive(Debug)]
 pub struct Atomic<T> {
     data: AtomicUsize,

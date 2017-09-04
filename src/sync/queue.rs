@@ -31,10 +31,10 @@ unsafe impl<T: Send> Sync for Queue<T> {}
 unsafe impl<T: Send> Send for Queue<T> {}
 
 
-impl<T> Queue<T> {
+impl<T> Default for Queue<T> {
     /// Create a new, empty queue.
-    pub fn new() -> Queue<T> {
-        let q = Queue {
+    fn default() -> Self {
+        let q = Self {
             head: CachePadded::new(Atomic::null()),
             tail: CachePadded::new(Atomic::null()),
         };
@@ -50,6 +50,13 @@ impl<T> Queue<T> {
                 q
             })
         }
+    }
+}
+
+impl<T> Queue<T> {
+    /// Create a new, empty queue.
+    pub fn new() -> Self {
+        Self::default()
     }
 
     #[inline(always)]

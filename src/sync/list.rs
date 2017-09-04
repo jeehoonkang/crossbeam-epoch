@@ -19,8 +19,10 @@ struct NodeInner<T> {
     next: Atomic<Node<T>>,
 }
 
+#[derive(Debug)]
 pub struct Node<T>(CachePadded<NodeInner<T>>);
 
+#[derive(Debug)]
 pub struct List<T> {
     head: Atomic<Node<T>>,
 }
@@ -69,10 +71,16 @@ impl<T> Node<T> {
     }
 }
 
+impl<T> Default for List<T> {
+    fn default() -> Self {
+        Self { head: Atomic::null() }
+    }
+}
+
 impl<T> List<T> {
     /// Returns a new, empty linked list.
     pub fn new() -> Self {
-        List { head: Atomic::null() }
+        Self::default()
     }
 
     /// Inserts `data` into the list.
@@ -185,11 +193,5 @@ where
 
         // We reached the end of the list.
         IterResult::None
-    }
-}
-
-impl<T> Default for List<T> {
-    fn default() -> Self {
-        Self::new()
     }
 }
