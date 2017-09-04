@@ -8,7 +8,7 @@
 
 use std::cmp;
 use std::sync::atomic::Ordering::{Relaxed, SeqCst};
-use mutator::{Mutator, LocalEpoch, Scope, unprotected_with_bag};
+use mutator::{Mutator, LocalEpoch, EpochScope};
 use garbage::Bag;
 use epoch::Epoch;
 use sync::list::List;
@@ -20,10 +20,6 @@ const COLLECT_STEPS: usize = 8;
 
 
 // FIXME(jeehoonkang): accessing globals in `lazy_static!` is blocking.
-//
-// Since static globals defined in `lazy_static!` are never dropped
-// (https://github.com/rust-lang/rfcs/blob/master/text/1440-drop-types-in-const.md), it is safe to
-// use `unprotected()` in `List`'s destructor.
 lazy_static! {
     /// REGISTRIES is the head pointer of the list of mutator registries.
     pub static ref REGISTRIES: List<LocalEpoch> = List::new();
@@ -36,7 +32,8 @@ lazy_static! {
 
 /// Pushes the bag onto the global queue and replaces the bag with a new empty bag.
 #[inline]
-pub fn push_bag<'scope>(bag: &mut Bag, scope: &'scope Scope) {
+pub fn push_bag<'scope>(bag: &mut Bag, scope: &'scope EpochScope) {
+
     let epoch = EPOCH.load(Relaxed);
     let bag = ::std::mem::replace(bag, Bag::new());
     ::std::sync::atomic::fence(SeqCst);
@@ -46,7 +43,7 @@ pub fn push_bag<'scope>(bag: &mut Bag, scope: &'scope Scope) {
 /// Collect several bags from the global old garbage queue and destroys their objects.
 ///
 /// Note: This may itself produce garbage and in turn allocate new bags.
-pub fn collect(scope: &Scope) {
+pub fn collect(scope: &EpochScope) {
     let epoch = EPOCH.try_advance(&REGISTRIES, scope);
 
     let condition = |bag: &(usize, Bag)| {
@@ -74,7 +71,7 @@ thread_local! {
 /// Pin the current thread.
 pub fn pin<F, R>(f: F) -> R
 where
-    F: FnOnce(&Scope) -> R,
+    F: FnOnce(&EpochScope) -> R,
 {
     MUTATOR.with(|mutator| mutator.pin(f))
 }
@@ -84,39 +81,6 @@ pub fn is_pinned() -> bool {
     MUTATOR.with(|mutator| mutator.is_pinned())
 }
 
-/// Returns a [`Scope`] without pinning any mutator.
-///
-/// Sometimes, we'd like to have longer-lived scopes in which we know our thread is the only one
-/// accessing atomics. This is true e.g. when destructing a big data structure, or when constructing
-/// it from a long iterator. In such cases we don't need to be overprotective because there is no
-/// fear of other threads concurrently destroying objects.
-///
-/// Function `unprotected` is *unsafe* because we must promise that no other thread is accessing the
-/// Atomics and objects at the same time. The function is safe to use only if (1) the locations that
-/// we access should not be deallocated by concurrent mutators, and (2) the locations that we
-/// deallocate should not be accessed by concurrent mutators.
-///
-/// Just like with the safe epoch::pin function, unprotected use of atomics is enclosed within a
-/// scope so that pointers created within it don't leak out or get mixed with pointers from other
-/// scopes.
-pub unsafe fn unprotected<F, R>(f: F) -> R
-where
-    F: FnOnce(&Scope) -> R,
-{
-    let mut bag = Bag::new();
-    unprotected_with_bag(&mut bag, f)
-}
-
-/// Returns a [`Scope`] without pinning any mutator, and with no backing garbage bag.
-///
-/// It is similar to the `unprotected` function, but no garbage should be made inside the scope.
-pub unsafe fn unprotected_without_garbages<F, R>(f: F) -> R
-where
-    F: FnOnce(&Scope) -> R,
-{
-    let mut bag = ::std::mem::zeroed::<Bag>();
-    unprotected_with_bag(&mut bag, f)
-}
 
 #[cfg(test)]
 mod tests {

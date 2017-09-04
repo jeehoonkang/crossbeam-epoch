@@ -38,6 +38,7 @@ extern crate arrayvec;
 extern crate boxfnonce;
 extern crate crossbeam_utils;
 
+mod scope;
 mod atomic;
 mod mutator;
 mod garbage;
@@ -46,5 +47,6 @@ mod global;
 mod sync;
 
 pub use self::atomic::{Atomic, CompareAndSetOrdering, Owned, Ptr};
-pub use self::global::{pin, is_pinned, unprotected, unprotected_without_garbages};
-pub use self::mutator::Scope;
+pub use self::global::{pin, is_pinned};
+pub use self::scope::Scope;
+pub use self::mutator::unprotected;

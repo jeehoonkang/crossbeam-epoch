@@ -25,9 +25,13 @@ pub struct List<T> {
     head: Atomic<Node<T>>,
 }
 
-pub struct Iter<'scope, T: 'scope> {
+pub struct Iter<'scope, S, T>
+where
+    S: Scope<'scope>,
+    T: 'scope,
+{
     /// The scope in which the iterator is operating.
-    scope: &'scope Scope,
+    scope: S,
 
     /// Pointer from the predecessor to the current entry.
     pred: &'scope Atomic<Node<T>>,
@@ -56,7 +60,11 @@ impl<T> Node<T> {
     }
 
     /// Marks this entry as deleted.
-    pub fn delete<'scope>(&self, scope: &Scope) {
+    pub fn delete<'scope, S>(&self, scope: S)
+    where
+        T: 'scope,
+        S: Scope<'scope>,
+    {
         self.0.next.fetch_or(1, Release, scope);
     }
 }
@@ -68,12 +76,15 @@ impl<T> List<T> {
     }
 
     /// Inserts `data` into the list.
-    pub fn insert<'scope>(
+    pub fn insert<'scope, S>(
         &'scope self,
         to: &'scope Atomic<Node<T>>,
         data: T,
-        scope: &'scope Scope,
-    ) -> Ptr<'scope, Node<T>> {
+        scope: S,
+    ) -> Ptr<'scope, Node<T>>
+    where
+        S: Scope<'scope>,
+    {
         let mut cur = Owned::new(Node::new(data));
         let mut next = to.load(Relaxed, scope);
 
@@ -89,11 +100,10 @@ impl<T> List<T> {
         }
     }
 
-    pub fn insert_head<'scope>(
-        &'scope self,
-        data: T,
-        scope: &'scope Scope,
-    ) -> Ptr<'scope, Node<T>> {
+    pub fn insert_head<'scope, S>(&'scope self, data: T, scope: S) -> Ptr<'scope, Node<T>>
+    where
+        S: Scope<'scope>,
+    {
         self.insert(&self.head, data, scope)
     }
 
@@ -106,7 +116,11 @@ impl<T> List<T> {
     /// 1. If a new datum is inserted during iteration, it may or may not be returned.
     /// 2. If a datum is deleted during iteration, it may or may not be returned.
     /// 3. It may not return all data if a concurrent thread continues to iterate the same list.
-    pub fn iter<'scope>(&'scope self, scope: &'scope Scope) -> Iter<'scope, T> {
+    pub fn iter<'scope, S>(&'scope self, scope: S) -> Iter<'scope, S, T>
+    where
+        T: 'scope,
+        S: Scope<'scope>,
+    {
         let pred = &self.head;
         let curr = pred.load(Acquire, scope);
         Iter { scope, pred, curr }
@@ -128,7 +142,10 @@ impl<T> Drop for List<T> {
     }
 }
 
-impl<'scope, T> Iter<'scope, T> {
+impl<'scope, S, T> Iter<'scope, S, T>
+where
+    S: Scope<'scope>,
+{
     pub fn next(&mut self) -> IterResult<T> {
         while let Some(c) = unsafe { self.curr.as_ref() } {
             let succ = c.0.next.load(Acquire, self.scope);

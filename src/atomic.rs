@@ -5,7 +5,7 @@ use std::ops::{Deref, DerefMut};
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 
-use mutator::Scope;
+use scope::Scope;
 
 /// Given ordering for the success case in a compare-exchange operation, returns the strongest
 /// appropriate ordering for the failure case.
@@ -204,7 +204,10 @@ impl<T> Atomic<T> {
     ///     let p = a.load(SeqCst, scope);
     /// });
     /// ```
-    pub fn load<'scope>(&self, ord: Ordering, _: &'scope Scope) -> Ptr<'scope, T> {
+    pub fn load<'scope, S>(&self, ord: Ordering, _: S) -> Ptr<'scope, T>
+    where
+        S: Scope<'scope>,
+    {
         Ptr::from_data(self.data.load(ord))
     }
 
@@ -268,7 +271,10 @@ impl<T> Atomic<T> {
     ///     let p = a.swap(Ptr::null(), SeqCst, scope);
     /// });
     /// ```
-    pub fn swap<'scope>(&self, new: Ptr<T>, ord: Ordering, _: &'scope Scope) -> Ptr<'scope, T> {
+    pub fn swap<'scope, S>(&self, new: Ptr<T>, ord: Ordering, _: S) -> Ptr<'scope, T>
+    where
+        S: Scope<'scope>,
+    {
         Ptr::from_data(self.data.swap(new.data, ord))
     }
 
@@ -295,15 +301,16 @@ impl<T> Atomic<T> {
     ///     let res = a.compare_and_set(curr, Ptr::null(), SeqCst, scope);
     /// });
     /// ```
-    pub fn compare_and_set<'scope, O>(
+    pub fn compare_and_set<'scope, O, S>(
         &self,
         current: Ptr<T>,
         new: Ptr<T>,
         ord: O,
-        _: &'scope Scope,
+        _: S,
     ) -> Result<(), Ptr<'scope, T>>
     where
         O: CompareAndSetOrdering,
+        S: Scope<'scope>,
     {
         match self.data.compare_exchange(
             current.data,
@@ -347,15 +354,16 @@ impl<T> Atomic<T> {
     ///     }
     /// });
     /// ```
-    pub fn compare_and_set_weak<'scope, O>(
+    pub fn compare_and_set_weak<'scope, O, S>(
         &self,
         current: Ptr<T>,
         new: Ptr<T>,
         ord: O,
-        _: &'scope Scope,
+        _: S,
     ) -> Result<(), Ptr<'scope, T>>
     where
         O: CompareAndSetOrdering,
+        S: Scope<'scope>,
     {
         match self.data.compare_exchange_weak(
             current.data,
@@ -392,15 +400,16 @@ impl<T> Atomic<T> {
     ///     let res = a.compare_and_set_owned(curr, Owned::new(5678), SeqCst, scope);
     /// });
     /// ```
-    pub fn compare_and_set_owned<'scope, O>(
+    pub fn compare_and_set_owned<'scope, O, S>(
         &self,
         current: Ptr<T>,
         new: Owned<T>,
         ord: O,
-        _: &'scope Scope,
+        _: S,
     ) -> Result<Ptr<'scope, T>, (Ptr<'scope, T>, Owned<T>)>
     where
         O: CompareAndSetOrdering,
+        S: Scope<'scope>,
     {
         match self.data.compare_exchange(
             current.data,
@@ -456,15 +465,16 @@ impl<T> Atomic<T> {
     ///     }
     /// });
     /// ```
-    pub fn compare_and_set_weak_owned<'scope, O>(
+    pub fn compare_and_set_weak_owned<'scope, O, S>(
         &self,
         current: Ptr<T>,
         new: Owned<T>,
         ord: O,
-        _: &'scope Scope,
+        _: S,
     ) -> Result<Ptr<'scope, T>, (Ptr<'scope, T>, Owned<T>)>
     where
         O: CompareAndSetOrdering,
+        S: Scope<'scope>,
     {
         match self.data.compare_exchange_weak(
             current.data,
@@ -503,7 +513,10 @@ impl<T> Atomic<T> {
     ///     assert_eq!(a.load(SeqCst, scope).tag(), 2);
     /// });
     /// ```
-    pub fn fetch_and<'scope>(&self, val: usize, ord: Ordering, _: &'scope Scope) -> Ptr<'scope, T> {
+    pub fn fetch_and<'scope, S>(&self, val: usize, ord: Ordering, _: S) -> Ptr<'scope, T>
+    where
+        S: Scope<'scope>,
+    {
         Ptr::from_data(self.data.fetch_and(val | !low_bits::<T>(), ord))
     }
 
@@ -529,7 +542,10 @@ impl<T> Atomic<T> {
     ///     assert_eq!(a.load(SeqCst, scope).tag(), 3);
     /// });
     /// ```
-    pub fn fetch_or<'scope>(&self, val: usize, ord: Ordering, _: &'scope Scope) -> Ptr<'scope, T> {
+    pub fn fetch_or<'scope, S>(&self, val: usize, ord: Ordering, _: S) -> Ptr<'scope, T>
+    where
+        S: Scope<'scope>,
+    {
         Ptr::from_data(self.data.fetch_or(val & low_bits::<T>(), ord))
     }
 
@@ -555,7 +571,10 @@ impl<T> Atomic<T> {
     ///     assert_eq!(a.load(SeqCst, scope).tag(), 2);
     /// });
     /// ```
-    pub fn fetch_xor<'scope>(&self, val: usize, ord: Ordering, _: &'scope Scope) -> Ptr<'scope, T> {
+    pub fn fetch_xor<'scope, S>(&self, val: usize, ord: Ordering, _: S) -> Ptr<'scope, T>
+    where
+        S: Scope<'scope>,
+    {
         Ptr::from_data(self.data.fetch_xor(val & low_bits::<T>(), ord))
     }
 }
@@ -677,7 +696,10 @@ impl<T> Owned<T> {
     /// ```
     ///
     /// [`Ptr`]: struct.Ptr.html
-    pub fn into_ptr<'scope>(self, _: &'scope Scope) -> Ptr<'scope, T> {
+    pub fn into_ptr<'scope, S>(self, _: S) -> Ptr<'scope, T>
+    where
+        S: Scope<'scope>,
+    {
         let data = self.data;
         mem::forget(self);
         Ptr::from_data(data)

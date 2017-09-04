@@ -55,7 +55,11 @@ impl<T> Queue<T> {
     #[inline(always)]
     /// Attempt to atomically place `n` into the `next` pointer of `onto`, and return if it
     /// succeeded. the queue's `tail` pointer may be updated.
-    fn push_internal(&self, onto: Ptr<Node<T>>, new: Ptr<Node<T>>, scope: &Scope) -> bool {
+    fn push_internal<'scope, S>(&self, onto: Ptr<Node<T>>, new: Ptr<Node<T>>, scope: S) -> bool
+    where
+        T: 'scope,
+        S: Scope<'scope>,
+    {
         // is `onto` the actual tail?
         let o = unsafe { onto.deref() };
         let next = o.next.load(Acquire, scope);
@@ -77,7 +81,11 @@ impl<T> Queue<T> {
     }
 
     /// Add `t` to the back of the queue, possibly waking up threads blocked on `pop`.
-    pub fn push(&self, t: T, scope: &Scope) {
+    pub fn push<'scope, S>(&self, t: T, scope: S)
+    where
+        T: 'scope,
+        S: Scope<'scope>,
+    {
         let new = Owned::new(Node {
             data: t,
             next: Atomic::null(),
@@ -97,7 +105,11 @@ impl<T> Queue<T> {
 
     #[inline(always)]
     // Attempt to pop a data node. `Ok(None)` if queue is empty; `Err(())` if lost race to pop.
-    fn pop_internal(&self, scope: &Scope) -> Result<Option<T>, ()> {
+    fn pop_internal<'scope, S>(&self, scope: S) -> Result<Option<T>, ()>
+    where
+        T: 'scope,
+        S: Scope<'scope>,
+    {
         let head = self.head.load(Acquire, scope);
         let h = unsafe { head.deref() };
         let next = h.next.load(Acquire, scope);
@@ -118,9 +130,10 @@ impl<T> Queue<T> {
     #[inline(always)]
     // Attempt to pop a data node, if the data satisfies the given condition. `Ok(None)` if queue is
     // empty or the data does not satisfy the condition; `Err(())` if lost race to pop.
-    fn pop_if_internal<F>(&self, condition: F, scope: &Scope) -> Result<Option<T>, ()>
+    fn pop_if_internal<'scope, S, F>(&self, condition: F, scope: S) -> Result<Option<T>, ()>
     where
-        T: Sync,
+        T: 'scope + Sync,
+        S: Scope<'scope>,
         F: Fn(&T) -> bool,
     {
         let head = self.head.load(Acquire, scope);
@@ -152,7 +165,11 @@ impl<T> Queue<T> {
     /// Attempt to dequeue from the front.
     ///
     /// Returns `None` if the queue is observed to be empty.
-    pub fn try_pop(&self, scope: &Scope) -> Option<T> {
+    pub fn try_pop<'scope, S>(&self, scope: S) -> Option<T>
+    where
+        T: 'scope,
+        S: Scope<'scope>,
+    {
         loop {
             if let Ok(head) = self.pop_internal(scope) {
                 return head;
@@ -164,9 +181,10 @@ impl<T> Queue<T> {
     ///
     /// Returns `None` if the queue is observed to be empty, or the head does not satisfy the given
     /// condition.
-    pub fn try_pop_if<F>(&self, condition: F, scope: &Scope) -> Option<T>
+    pub fn try_pop_if<'scope, S, F>(&self, condition: F, scope: S) -> Option<T>
     where
-        T: Sync,
+        T: 'scope + Sync,
+        S: Scope<'scope>,
         F: Fn(&T) -> bool,
     {
         loop {

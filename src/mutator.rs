@@ -12,14 +12,14 @@
 //! the global epoch at the time it was pinned. Mutators also hold a pin counter that aids in
 //! periodic global epoch advancement.
 //!
-//! When a mutator is pinned, a `Scope` is returned as a witness that the mutator is pinned.  Scopes
-//! are necessary for performing atomic operations, and for freeing/dropping locations.
+//! When a mutator is pinned, a `EpochScope` is returned as a witness that the mutator is pinned.
+//! EpochScopes are necessary for performing atomic operations, and for freeing/dropping locations.
 
 use std::cell::{Cell, UnsafeCell};
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering::{Relaxed, Release, SeqCst};
 
-use atomic::Ptr;
+use scope::Scope;
 use sync::list::Node;
 use garbage::{Garbage, Bag};
 use global;
@@ -51,28 +51,36 @@ pub struct LocalEpoch {
 
 /// A witness that the current mutator is pinned.
 ///
-/// A reference to `Scope` is a witness that the current mutator is pinned. Lots of methods that
-/// interact with [`Atomic`]s can safely be called only while the mutator is pinned so they often
-/// require a reference to `Scope`.
+/// A reference to `EpochScope` is a witness that the current mutator is pinned. Lots of methods
+/// that interact with [`Atomic`]s can safely be called only while the mutator is pinned so they
+/// often require a reference to `EpochScope`.
 ///
 /// This data type is inherently bound to the thread that created it, therefore it does not
 /// implement `Send` nor `Sync`.
 ///
 /// [`Atomic`]: struct.Atomic.html
 #[derive(Debug)]
-pub struct Scope {
+pub struct EpochScope {
     bag: *mut Bag, // !Send + !Sync
 }
 
+/// Unprotected scope.
+///
+/// In `UnprotectedScope`, the client should guarantee that it is the only one accessing
+/// atomics. Lots of methods that interact with [`Atomic`]s accept `UnprotectedScope` as well as
+/// `&EpochScope`.
+///
+/// [`Atomic`]: struct.Atomic.html
+#[derive(Debug, Clone, Copy, Default)]
+pub struct UnprotectedScope {}
 
 impl<'scope> Mutator<'scope> {
     pub fn new() -> Self {
         Mutator {
             bag: UnsafeCell::new(Bag::new()),
             local_epoch: unsafe {
-                // Since we dereference no pointers in this block and create no garbages, it is safe
-                // to call `unprotected_without_garbages`.
-                global::unprotected_without_garbages(|scope| {
+                // Since we dereference no pointers in this block, it is safe to call `unprotected`.
+                unprotected(|scope| {
                     &*global::REGISTRIES
                         .insert_head(LocalEpoch::new(), scope)
                         .as_raw()
@@ -103,10 +111,10 @@ impl<'scope> Mutator<'scope> {
     /// [`Atomic`]: struct.Atomic.html
     pub fn pin<F, R>(&self, f: F) -> R
     where
-        F: FnOnce(&Scope) -> R,
+        F: FnOnce(&EpochScope) -> R,
     {
         let local_epoch = self.local_epoch.get();
-        let scope = &Scope { bag: self.bag.get() };
+        let scope = &EpochScope { bag: self.bag.get() };
 
         let was_pinned = self.is_pinned.get();
         if !was_pinned {
@@ -162,14 +170,29 @@ impl<'scope> Drop for Mutator<'scope> {
     }
 }
 
-/// Returns a [`Scope`] without pinning any mutator, with arbitrary bag.
+/// Returns a [`Scope`] without pinning any mutator.
+///
+/// Sometimes, we'd like to have longer-lived scopes in which we know our thread is the only one
+/// accessing atomics. This is true e.g. when destructing a big data structure, or when constructing
+/// it from a long iterator. In such cases we don't need to be overprotective because there is no
+/// fear of other threads concurrently destroying objects.
+///
+/// Function `unprotected` is *unsafe* because we must promise that no other thread is accessing the
+/// Atomics and objects at the same time. The function is safe to use only if (1) the locations that
+/// we access should not be deallocated by concurrent mutators, and (2) the locations that we
+/// deallocate should not be accessed by concurrent mutators.
+///
+/// Just like with the safe epoch::pin function, unprotected use of atomics is enclosed within a
+/// scope so that pointers created within it don't leak out or get mixed with pointers from other
+/// scopes.
+///
+/// The garbages created inside an unprotected scope are immediately disposed.
 #[inline]
-pub unsafe fn unprotected_with_bag<F, R>(bag: &mut Bag, f: F) -> R
+pub unsafe fn unprotected<F, R>(f: F) -> R
 where
-    F: FnOnce(&Scope) -> R,
+    F: FnOnce(UnprotectedScope) -> R,
 {
-    let scope = &Scope { bag: bag };
-    f(scope)
+    f(UnprotectedScope::default())
 }
 
 impl LocalEpoch {
@@ -224,43 +247,26 @@ impl LocalEpoch {
     }
 }
 
-impl Scope {
+impl EpochScope {
     unsafe fn get_bag(&self) -> &mut Bag {
         &mut *self.bag
     }
+}
 
-    unsafe fn defer_garbage(&self, mut garbage: Garbage) {
+impl<'scope> Scope<'scope> for &'scope EpochScope {
+    /// Deferred disposal of garbage.
+    ///
+    /// This function inserts the garbage into a mutator-local [`Bag`]. When the bag becomes full,
+    /// the bag is flushed into the globally shared queue of bags.
+    ///
+    /// [`Bag`]: struct.Bag.html
+    unsafe fn defer_dispose(self, mut garbage: Garbage) {
         let bag = self.get_bag();
 
         while let Err(g) = bag.try_push(garbage) {
             global::push_bag(bag, self);
             garbage = g;
         }
-    }
-
-    /// Deferred deallocation of heap-allocated object `ptr`.
-    ///
-    /// This function inserts the object into a mutator-local [`Bag`]. When the bag becomes full,
-    /// the bag is flushed into the globally shared queue of bags.
-    ///
-    /// If the object is unusually large, it is wise to follow up with a call to [`flush`] so that
-    /// it doesn't get stuck waiting in the local bag for a long time.
-    ///
-    /// [`Bag`]: struct.Bag.html
-    /// [`flush`]: fn.flush.html
-    pub unsafe fn defer_free<T>(&self, ptr: Ptr<T>) {
-        self.defer_garbage(Garbage::new_free(ptr.as_raw() as *mut T, 1))
-    }
-
-    /// Deferred destruction and deallocation of heap-allocated object `ptr`.
-    // FIXME(jeehoonkang): `T: 'static` may be too restrictive.
-    pub unsafe fn defer_drop<T: Send + 'static>(&self, ptr: Ptr<T>) {
-        self.defer_garbage(Garbage::new_drop(ptr.as_raw() as *mut T, 1))
-    }
-
-    /// Deferred execution of an arbitrary function `f`.
-    pub unsafe fn defer<F: FnOnce() + Send + 'static>(&self, f: F) {
-        self.defer_garbage(Garbage::new(f))
     }
 
     /// Flushes all garbage in the thread-local storage into the global garbage queue, attempts to
@@ -272,8 +278,9 @@ impl Scope {
     /// It is wise to flush the bag just after passing a very large object to [`defer_free`] or
     /// [`defer_drop`], so that it isn't sitting in the local bag for a long time.
     ///
-    /// [`defer_free`]: fn.defer_free.html [`defer_drop`]: fn.defer_drop.html
-    pub fn flush(&self) {
+    /// [`defer_free`]: fn.defer_free.html
+    /// [`defer_drop`]: fn.defer_drop.html
+    fn flush(self) {
         unsafe {
             let bag = self.get_bag();
             if !bag.is_empty() {
@@ -283,6 +290,16 @@ impl Scope {
 
         global::collect(self);
     }
+}
+
+impl<'scope> Scope<'scope> for UnprotectedScope {
+    /// Disposes garbage immediately.
+    unsafe fn defer_dispose(self, garbage: Garbage) {
+        drop(garbage)
+    }
+
+    /// Does nothing.
+    fn flush(self) {}
 }
 
 

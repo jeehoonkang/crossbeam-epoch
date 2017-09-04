@@ -12,7 +12,7 @@ use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering::{Relaxed, Acquire, Release, SeqCst};
 
 use mutator::LocalEpoch;
-use mutator::Scope;
+use mutator::EpochScope;
 use sync::list::{List, IterResult};
 use crossbeam_utils::cache_padded::CachePadded;
 
@@ -34,7 +34,7 @@ impl Epoch {
     ///
     /// Returns the current global epoch.
     #[cold]
-    pub fn try_advance<'scope>(&self, registries: &List<LocalEpoch>, scope: &Scope) -> usize {
+    pub fn try_advance<'scope>(&self, registries: &List<LocalEpoch>, scope: &EpochScope) -> usize {
         let epoch = self.epoch.load(Relaxed);
         ::std::sync::atomic::fence(SeqCst);
 
