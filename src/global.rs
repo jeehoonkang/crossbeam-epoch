@@ -104,10 +104,19 @@ where
     F: FnOnce(&Scope) -> R,
 {
     let mut bag = Bag::new();
-    let result = unprotected_with_bag(&mut bag, f);
-    result
+    unprotected_with_bag(&mut bag, f)
 }
 
+/// Returns a [`Scope`] without pinning any mutator, and with no backing garbage bag.
+///
+/// It is similar to the `unprotected` function, but no garbage should be made inside the scope.
+pub unsafe fn unprotected_without_garbages<F, R>(f: F) -> R
+where
+    F: FnOnce(&Scope) -> R,
+{
+    let mut bag = ::std::mem::zeroed::<Bag>();
+    unprotected_with_bag(&mut bag, f)
+}
 
 #[cfg(test)]
 mod tests {

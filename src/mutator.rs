@@ -71,9 +71,8 @@ impl<'scope> Mutator<'scope> {
             bag: UnsafeCell::new(Bag::new()),
             local_epoch: unsafe {
                 // Since we dereference no pointers in this block and create no garbages, it is safe
-                // to use `unprotected_with_bag` with an invalid bag.
-                let mut bag = ::std::mem::zeroed::<Bag>();
-                unprotected_with_bag(&mut bag, |scope| {
+                // to call `unprotected_without_garbages`.
+                global::unprotected_without_garbages(|scope| {
                     &*global::REGISTRIES
                         .insert_head(LocalEpoch::new(), scope)
                         .as_raw()
