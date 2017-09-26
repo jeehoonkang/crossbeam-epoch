@@ -91,8 +91,7 @@ impl Collector {
         let local_epoch = unsafe {
             // Since we dereference no pointers in this block, it is safe to use `unprotected`.
             unprotected(|scope| {
-                &*self
-                    .registries
+                &*self.registries
                     .insert_head(LocalEpoch::new(), scope)
                     .as_raw()
             })
