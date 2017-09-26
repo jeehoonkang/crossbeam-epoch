@@ -21,18 +21,21 @@ use garbage::{Garbage, Bag};
 use collector::Collector;
 
 
+// FIXME(stjepang): Registries are stored in a linked list because linked lists are fairly easy to
+// implement in a lock-free manner. However, traversal is rather slow due to cache misses and data
+// dependencies. We should experiment with other data structures as well.
 /// Reference to a garbage collection collector
 pub struct Mutator<'scope> {
     /// A reference to the global data.
-    collector: &'scope Collector,
+    pub(crate) collector: &'scope Collector,
     /// The local garbage objects that will be later freed.
-    bag: UnsafeCell<Bag>,
+    pub(crate) bag: UnsafeCell<Bag>,
     /// This mutator's entry in the local epoch list.
-    local_epoch: &'scope Node<LocalEpoch>,
+    pub(crate) local_epoch: &'scope Node<LocalEpoch>,
     /// Whether the mutator is currently pinned.
-    is_pinned: Cell<bool>,
+    pub(crate) is_pinned: Cell<bool>,
     /// Total number of pinnings performed.
-    pin_count: Cell<usize>,
+    pub(crate) pin_count: Cell<usize>,
 }
 
 /// An entry in the linked list of the registered mutators.
@@ -65,16 +68,6 @@ pub struct Scope<'scope> {
 impl<'scope> Mutator<'scope> {
     /// Number of pinnings after which a mutator will collect some global garbage.
     const PINS_BETWEEN_COLLECT: usize = 128;
-
-    pub fn new(collector: &'scope Collector) -> Self {
-        Mutator {
-            collector: collector,
-            bag: UnsafeCell::new(Bag::new()),
-            local_epoch: collector.register(),
-            is_pinned: Cell::new(false),
-            pin_count: Cell::new(0),
-        }
-    }
 
     /// Pins the current mutator, executes a function, and unpins the mutator.
     ///
@@ -180,10 +173,6 @@ where
 }
 
 impl LocalEpoch {
-    // FIXME(stjepang): Registries are stored in a linked list because linked lists are fairly easy
-    // to implement in a lock-free manner. However, traversal is rather slow due to cache misses and
-    // data dependencies. We should experiment with other data structures as well.
-
     #[inline]
     pub fn new() -> Self {
         Self::default()
@@ -294,14 +283,13 @@ mod tests {
     use crossbeam_utils::scoped;
 
     use super::*;
-    use mutator::Mutator;
 
     const NUM_THREADS: usize = 8;
 
     #[test]
     fn pin_reentrant() {
         let collector = Collector::new();
-        let mutator = Mutator::new(&collector);
+        let mutator = collector.add_mutator();
 
         assert!(!mutator.is_pinned());
         mutator.pin(|_| {
@@ -321,7 +309,7 @@ mod tests {
             .map(|_| {
                 scoped::scope(|scope| {
                     scope.spawn(|| for _ in 0..100_000 {
-                        let mutator = Mutator::new(&collector);
+                        let mutator = collector.add_mutator();
                         mutator.pin(|scope| {
                             let before = collector.get_epoch();
                             collector.collect(scope);
