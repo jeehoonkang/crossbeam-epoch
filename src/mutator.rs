@@ -25,9 +25,7 @@ use collector::Collector;
 // implement in a lock-free manner. However, traversal is rather slow due to cache misses and data
 // dependencies. We should experiment with other data structures as well.
 /// Reference to a garbage collection collector
-pub struct Mutator<'scope> {
-    /// A reference to the global data.
-    pub(crate) collector: &'scope Collector,
+pub struct Inner<'scope> {
     /// The local garbage objects that will be later freed.
     pub(crate) bag: UnsafeCell<Bag>,
     /// This mutator's entry in the local epoch list.
@@ -65,7 +63,7 @@ pub struct Scope<'scope> {
 }
 
 
-impl<'scope> Mutator<'scope> {
+impl<'scope> Inner<'scope> {
     /// Number of pinnings after which a mutator will collect some global garbage.
     const PINS_BETWEEN_COLLECT: usize = 128;
 
@@ -87,13 +85,14 @@ impl<'scope> Mutator<'scope> {
     /// it can be used pretty liberally. On a modern machine pinning takes 10 to 15 nanoseconds.
     ///
     /// [`Atomic`]: struct.Atomic.html
-    pub fn pin<F, R>(&self, f: F) -> R
+    #[inline]
+    pub fn pin<F, R>(&'scope self, collector: &'scope Collector, f: F) -> R
     where
         F: FnOnce(&Scope) -> R,
     {
         let local_epoch = self.local_epoch.get();
         let scope = &Scope {
-            collector: self.collector,
+            collector: collector,
             bag: self.bag.get(),
         };
 
@@ -105,12 +104,12 @@ impl<'scope> Mutator<'scope> {
 
             // Pin the mutator.
             self.is_pinned.set(true);
-            let epoch = self.collector.get_epoch();
+            let epoch = collector.get_epoch();
             local_epoch.set_pinned(epoch);
 
             // If the counter progressed enough, try advancing the epoch and collecting garbage.
             if count % Self::PINS_BETWEEN_COLLECT == 0 {
-                self.collector.collect(scope);
+                collector.collect(scope);
             }
         }
 
@@ -127,28 +126,32 @@ impl<'scope> Mutator<'scope> {
     }
 
     /// Returns `true` if the current mutator is pinned.
+    #[inline]
     pub fn is_pinned(&'scope self) -> bool {
         self.is_pinned.get()
     }
 }
 
-impl<'scope> Drop for Mutator<'scope> {
-    fn drop(&mut self) {
-        // Now that the mutator is exiting, we must move the local bag into the global garbage
-        // queue. Also, let's try advancing the epoch and help free some garbage.
+pub trait Mutator<'scope> {
+    fn as_collector(&'scope self) -> &'scope Collector;
 
-        self.pin(|scope| {
-            // Spare some cycles on garbage collection.
-            self.collector.collect(scope);
+    fn as_inner(&'scope self) -> &'scope Inner<'scope>;
 
-            // Unregister the mutator by marking this entry as deleted.
-            self.local_epoch.delete(scope);
+    fn pin<F, R>(&'scope self, f: F) -> R
+    where
+        F: FnOnce(&Scope) -> R,
+    {
+        self.as_inner().pin(self.as_collector(), f)
+    }
 
-            // Push the local bag into the global garbage queue.
-            unsafe {
-                self.collector.push_bag(&mut *self.bag.get(), scope);
-            }
-        });
+    #[inline]
+    fn is_pinned(&'scope self) -> bool {
+        self.as_inner().is_pinned()
+    }
+
+    #[inline]
+    fn finalize(&'scope self) {
+        self.as_collector().remove_mutator(self.as_inner());
     }
 }
 
@@ -290,16 +293,14 @@ mod tests {
 
     use super::*;
 
-    const NUM_THREADS: usize = 8;
-
     #[test]
     fn pin_reentrant() {
         let collector = Collector::new();
         let mutator = collector.add_mutator();
 
         assert!(!mutator.is_pinned());
-        mutator.pin(|_| {
-            mutator.pin(|_| {
+        mutator.pin(&collector, |_| {
+            mutator.pin(&collector, |_| {
                 assert!(mutator.is_pinned());
             });
             assert!(mutator.is_pinned());
@@ -309,14 +310,14 @@ mod tests {
 
     #[test]
     fn pin_holds_advance() {
-        let collector = Collector::new();
+        let ref collector = Collector::new();
 
-        let threads = (0..NUM_THREADS)
+        let threads = (0..8)
             .map(|_| {
                 scoped::scope(|scope| {
                     scope.spawn(|| for _ in 0..100_000 {
                         let mutator = collector.add_mutator();
-                        mutator.pin(|scope| {
+                        mutator.pin(collector, |scope| {
                             let before = collector.get_epoch();
                             collector.collect(scope);
                             let after = collector.get_epoch();

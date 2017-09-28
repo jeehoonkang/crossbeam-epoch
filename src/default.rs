@@ -5,17 +5,51 @@
 //! on thread exit, which in turn unregisters the thread.
 
 use collector::Collector;
-use mutator::{Mutator, Scope};
+use mutator::{Mutator, Inner, Scope};
 
 lazy_static! {
     /// The default global data.
     // FIXME(jeehoonkang): accessing globals in `lazy_static!` is blocking.
-    pub static ref COLLECTOR: Collector = Collector::new();
+    static ref COLLECTOR: Collector = Collector::new();
 }
 
 thread_local! {
     /// The thread-local mutator for the default global data.
-    static MUTATOR: Mutator<'static> = COLLECTOR.add_mutator();
+    static MUTATOR: MutatorImpl<'static> = {
+        let collector = &COLLECTOR;
+        MutatorImpl::new(collector, collector.add_mutator())
+    };
+}
+
+struct MutatorImpl<'scope> {
+    /// A reference to the global data.
+    collector: &'scope Collector,
+    /// FIXME
+    inner: Inner<'scope>,
+}
+
+impl<'scope> MutatorImpl<'scope> {
+    fn new(collector: &'scope Collector, inner: Inner<'scope>) -> Self {
+        Self { collector, inner }
+    }
+}
+
+impl<'scope> Mutator<'scope> for MutatorImpl<'scope> {
+    #[inline]
+    fn as_collector(&'scope self) -> &'scope Collector {
+        self.collector
+    }
+
+    #[inline]
+    fn as_inner(&'scope self) -> &'scope Inner<'scope> {
+        &self.inner
+    }
+}
+
+impl<'scope> Drop for MutatorImpl<'scope> {
+    fn drop(&mut self) {
+        self.finalize()
+    }
 }
 
 /// Pin the current thread.

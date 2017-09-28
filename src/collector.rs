@@ -9,7 +9,7 @@
 use std::cell::{Cell, UnsafeCell};
 use std::cmp;
 use std::sync::atomic::Ordering::{Relaxed, SeqCst};
-use mutator::{Mutator, LocalEpoch, Scope, unprotected};
+use mutator::{Inner as MutatorInner, LocalEpoch, Scope, unprotected};
 use garbage::Bag;
 use epoch::Epoch;
 use sync::list::List;
@@ -52,6 +52,12 @@ impl Collector {
         }
     }
 
+    /// Get the current global epoch.
+    #[inline]
+    pub fn get_epoch(&self) -> usize {
+        self.epoch.load(Relaxed)
+    }
+
     /// Pushes the bag onto the global queue and replaces the bag with a new empty bag.
     #[inline]
     pub fn push_bag<'scope>(&self, bag: &mut Bag, scope: &'scope Scope) {
@@ -87,7 +93,9 @@ impl Collector {
         }
     }
 
-    pub fn add_mutator<'scope>(&'scope self) -> Mutator<'scope> {
+    /// Add a mutator.
+    #[inline]
+    pub fn add_mutator<'scope>(&'scope self) -> MutatorInner<'scope> {
         let local_epoch = unsafe {
             // Since we dereference no pointers in this block, it is safe to use `unprotected`.
             unprotected(|scope| {
@@ -97,8 +105,7 @@ impl Collector {
             })
         };
 
-        Mutator {
-            collector: self,
+        MutatorInner {
             bag: UnsafeCell::new(Bag::new()),
             local_epoch: local_epoch,
             is_pinned: Cell::new(false),
@@ -106,7 +113,23 @@ impl Collector {
         }
     }
 
-    pub fn get_epoch(&self) -> usize {
-        self.epoch.load(Relaxed)
+    /// Remove a mutator.
+    #[inline]
+    pub fn remove_mutator<'scope>(&'scope self, mutator: &'scope MutatorInner<'scope>) {
+        // Now that the mutator is exiting, we must move the local bag into the global garbage
+        // queue. Also, let's try advancing the epoch and help free some garbage.
+
+        mutator.pin(self, |scope| {
+            // Spare some cycles on garbage collection.
+            self.collect(scope);
+
+            // Unregister the mutator by marking this entry as deleted.
+            mutator.local_epoch.delete(scope);
+
+            // Push the local bag into the global garbage queue.
+            unsafe {
+                self.push_bag(&mut *mutator.bag.get(), scope);
+            }
+        })
     }
 }
