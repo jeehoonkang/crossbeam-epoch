@@ -24,18 +24,16 @@ use collector::Collector;
 // FIXME(stjepang): Registries are stored in a linked list because linked lists are fairly easy to
 // implement in a lock-free manner. However, traversal is rather slow due to cache misses and data
 // dependencies. We should experiment with other data structures as well.
-/// Reference to a garbage collection collector
-pub struct Mutator<'scope> {
-    /// A reference to the global data.
-    pub(crate) collector: &'scope Collector,
+/// Local data for garbage collection.
+pub struct Inner<'scope> {
     /// The local garbage objects that will be later freed.
-    pub(crate) bag: UnsafeCell<Bag>,
+    bag: UnsafeCell<Bag>,
     /// This mutator's entry in the local epoch list.
-    pub(crate) local_epoch: &'scope Node<LocalEpoch>,
+    local_epoch: &'scope Node<LocalEpoch>,
     /// Whether the mutator is currently pinned.
-    pub(crate) is_pinned: Cell<bool>,
+    is_pinned: Cell<bool>,
     /// Total number of pinnings performed.
-    pub(crate) pin_count: Cell<usize>,
+    pin_count: Cell<usize>,
 }
 
 /// An entry in the linked list of the registered mutators.
@@ -64,10 +62,26 @@ pub struct Scope<'scope> {
     bag: *mut Bag, // !Send + !Sync
 }
 
+impl<'scope> Inner<'scope> {
+    pub fn new(collector: &'scope Collector) -> Self {
+        Self {
+            bag: UnsafeCell::new(Bag::new()),
+            local_epoch: collector.register_epoch(),
+            is_pinned: Cell::new(false),
+            pin_count: Cell::new(0),
+        }
+    }
+}
 
-impl<'scope> Mutator<'scope> {
+pub trait Mutator<'scope> {
     /// Number of pinnings after which a mutator will collect some global garbage.
     const PINS_BETWEEN_COLLECT: usize = 128;
+
+    #[inline]
+    fn as_collector(&'scope self) -> &'scope Collector;
+
+    #[inline]
+    fn as_inner(&'scope self) -> &'scope Inner<'scope>;
 
     /// Pins the current mutator, executes a function, and unpins the mutator.
     ///
@@ -87,30 +101,30 @@ impl<'scope> Mutator<'scope> {
     /// it can be used pretty liberally. On a modern machine pinning takes 10 to 15 nanoseconds.
     ///
     /// [`Atomic`]: struct.Atomic.html
-    pub fn pin<F, R>(&self, f: F) -> R
+    fn pin<F, R>(&'scope self, f: F) -> R
     where
         F: FnOnce(&Scope) -> R,
     {
-        let local_epoch = self.local_epoch.get();
+        let local_epoch = self.as_inner().local_epoch.get();
         let scope = &Scope {
-            collector: self.collector,
-            bag: self.bag.get(),
+            collector: self.as_collector(),
+            bag: self.as_inner().bag.get(),
         };
 
-        let was_pinned = self.is_pinned.get();
+        let was_pinned = self.as_inner().is_pinned.get();
         if !was_pinned {
             // Increment the pin counter.
-            let count = self.pin_count.get();
-            self.pin_count.set(count.wrapping_add(1));
+            let count = self.as_inner().pin_count.get();
+            self.as_inner().pin_count.set(count.wrapping_add(1));
 
             // Pin the mutator.
-            self.is_pinned.set(true);
-            let epoch = self.collector.get_epoch();
+            self.as_inner().is_pinned.set(true);
+            let epoch = self.as_collector().get_epoch();
             local_epoch.set_pinned(epoch);
 
             // If the counter progressed enough, try advancing the epoch and collecting garbage.
             if count % Self::PINS_BETWEEN_COLLECT == 0 {
-                self.collector.collect(scope);
+                self.as_collector().collect(scope);
             }
         }
 
@@ -119,7 +133,7 @@ impl<'scope> Mutator<'scope> {
             if !was_pinned {
                 // Unpin the mutator.
                 local_epoch.set_unpinned();
-                self.is_pinned.set(false);
+                self.as_inner().is_pinned.set(false);
             }
         }
 
@@ -127,28 +141,62 @@ impl<'scope> Mutator<'scope> {
     }
 
     /// Returns `true` if the current mutator is pinned.
-    pub fn is_pinned(&'scope self) -> bool {
-        self.is_pinned.get()
+    #[inline]
+    fn is_pinned(&'scope self) -> bool {
+        self.as_inner().is_pinned.get()
     }
-}
 
-impl<'scope> Drop for Mutator<'scope> {
-    fn drop(&mut self) {
+    /// Finalize the mutator.
+    #[inline]
+    fn finalize(&'scope self) {
         // Now that the mutator is exiting, we must move the local bag into the global garbage
         // queue. Also, let's try advancing the epoch and help free some garbage.
 
         self.pin(|scope| {
             // Spare some cycles on garbage collection.
-            self.collector.collect(scope);
+            self.as_collector().collect(scope);
 
             // Unregister the mutator by marking this entry as deleted.
-            self.local_epoch.delete(scope);
+            self.as_inner().local_epoch.delete(scope);
 
             // Push the local bag into the global garbage queue.
             unsafe {
-                self.collector.push_bag(&mut *self.bag.get(), scope);
+                self.as_collector().push_bag(&mut *self.as_inner().bag.get(), scope);
             }
         });
+    }
+}
+
+
+/// Reference to a garbage collection collector
+pub struct Impl<'scope> {
+    /// A reference to the global data.
+    collector: &'scope Collector,
+    /// FIXME
+    inner: Inner<'scope>,
+}
+
+impl<'scope> Impl<'scope> {
+    pub fn new(collector: &'scope Collector) -> Self {
+        Self { collector, inner: Inner::new(collector) }
+    }
+}
+
+impl<'scope> Mutator<'scope> for Impl<'scope> {
+    #[inline]
+    fn as_collector(&'scope self) -> &'scope Collector {
+        self.collector
+    }
+
+    #[inline]
+    fn as_inner(&'scope self) -> &'scope Inner<'scope> {
+        &self.inner
+    }
+}
+
+impl<'scope> Drop for Impl<'scope> {
+    fn drop(&mut self) {
+        self.finalize()
     }
 }
 
@@ -295,7 +343,7 @@ mod tests {
     #[test]
     fn pin_reentrant() {
         let collector = Collector::new();
-        let mutator = collector.add_mutator();
+        let mutator = Impl::new(&collector);
 
         assert!(!mutator.is_pinned());
         mutator.pin(|_| {
@@ -309,13 +357,13 @@ mod tests {
 
     #[test]
     fn pin_holds_advance() {
-        let collector = Collector::new();
+        let collector = &Collector::new();
 
         let threads = (0..NUM_THREADS)
             .map(|_| {
                 scoped::scope(|scope| {
                     scope.spawn(|| for _ in 0..100_000 {
-                        let mutator = collector.add_mutator();
+                        let mutator = Impl::new(collector);
                         mutator.pin(|scope| {
                             let before = collector.get_epoch();
                             collector.collect(scope);
@@ -331,5 +379,161 @@ mod tests {
         for t in threads {
             t.join();
         }
+    }
+
+    mod logger {
+        use std::sync::{Arc, Mutex};
+        use std::cell::UnsafeCell;
+
+        use super::*;
+        use Collector;
+
+        const MAX_LOCAL_LINES: usize = 8;
+        const MAX_GLOBAL_LINES: usize = 32;
+
+        struct Global {
+            lines: Arc<Mutex<Vec<String>>>,
+            collector: Collector,
+        }
+
+        impl Default for Global {
+            fn default() -> Global {
+                Global {
+                    lines: Arc::new(Mutex::new(Vec::with_capacity(MAX_GLOBAL_LINES))),
+                    collector: Collector::new(),
+                }
+            }
+        }
+
+        impl Global {
+            fn push(&self, line: String) {
+                let mut lines = self.lines.lock().unwrap();
+                if lines.len() == MAX_GLOBAL_LINES {
+                    Self::flush(&mut lines);
+                }
+                lines.push(line);
+            }
+
+            fn flush(lines: &mut Vec<String>) {
+                while let Some(_line) = lines.pop() {
+                    // println!("{}", line);
+                }
+            }
+
+            fn extend(to: &mut Vec<String>, from: &mut Vec<String>) {
+                while let Some(line) = from.pop() {
+                    to.push(line);
+                }
+            }
+        }
+
+        /// A logger that buffers logged lines.
+        pub struct Logger<'scope> {
+            lines: Vec<String>,
+            mutator: Inner<'scope>,
+            global: &'scope Global,
+        }
+
+        impl<'scope> Mutator<'scope> for Logger<'scope> {
+            #[inline]
+            fn as_collector(&self) -> &Collector {
+                &self.global.collector
+            }
+
+            #[inline]
+            fn as_inner(&self) -> &Inner<'scope> {
+                &self.mutator
+            }
+        }
+
+        impl<'scope> Logger<'scope> {
+            fn new(global: &'scope Global) -> Logger {
+                Logger {
+                    lines: Vec::with_capacity(MAX_LOCAL_LINES),
+                    mutator: Inner::new(&global.collector),
+                    global,
+                }
+            }
+
+            /// Log a line.
+            ///
+            /// The logged line may be buffered. To force buffered lines to be printed, use `flush`.
+            pub fn log(&mut self, line: String) {
+                if self.lines.len() == MAX_LOCAL_LINES {
+                    self.flush();
+                }
+                self.global.push(line);
+            }
+
+            /// Flush the buffer.
+            ///
+            /// Flushes any buffered log lines, printing them to stdout. These lines may be interpositioned
+            /// arbitrarily with lines printed from other handles.
+            pub fn flush(&mut self) {
+                let mut lines = self.global.lines.lock().unwrap();
+                Global::extend(&mut lines, &mut self.lines);
+                Global::flush(&mut lines);
+            }
+        }
+
+        impl<'scope> Clone for Logger<'scope> {
+            fn clone(&self) -> Self {
+                Self {
+                    lines: Vec::with_capacity(MAX_LOCAL_LINES),
+                    mutator: Inner::new(&self.global.collector),
+                    global: self.global,
+                }
+            }
+        }
+
+        impl<'scope> Drop for Logger<'scope> {
+            fn drop(&mut self) {
+                self.finalize();
+                let mut lines = self.global.lines.lock().unwrap();
+                Global::extend(&mut lines, &mut self.lines);
+            }
+        }
+
+        lazy_static!{ static ref GLOBAL_HANDLE: Global = Global::default(); }
+        thread_local!{ static TLS_HANDLE: UnsafeCell<Logger<'static>> = UnsafeCell::new(Logger::new(&GLOBAL_HANDLE)); }
+
+        /// Log a line.
+        ///
+        /// The logged line may be buffered. To force buffered lines to be printed, use `flush`.
+        pub fn log(line: String) {
+            let l = line.clone();
+            TLS_HANDLE.with(|handle| unsafe { (&mut *handle.get()).log(l) })
+        }
+
+        /// Flush the buffer.
+        ///
+        /// Flushes any buffered log lines, printing them to stdout. These lines may be interpositioned
+        /// arbitrarily with lines printed from other threads.
+        pub fn flush() {
+           TLS_HANDLE.with(|handle| unsafe { (&mut *handle.get()).flush() })
+        }
+
+    }
+
+    #[test]
+    fn composable() {
+        let threads = (0..NUM_THREADS)
+            .map(|i| {
+                scoped::scope(|scope| {
+                    scope.spawn(|| for j in 0..3 {
+                        logger::log(format!("({}, {})", i, j));
+                        if j == 2 {
+                            logger::flush();
+                        }
+                    })
+                })
+            })
+            .collect::<Vec<_>>();
+
+        for t in threads {
+            t.join();
+        }
+
+        logger::flush();
     }
 }

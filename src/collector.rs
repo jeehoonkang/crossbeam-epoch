@@ -6,13 +6,12 @@
 //! mutator is created, it is registered to a global lock-free singly-linked list of registries; and
 //! when a mutator is dropped, it is unregistered from the list.
 
-use std::cell::{Cell, UnsafeCell};
 use std::cmp;
 use std::sync::atomic::Ordering::{Relaxed, SeqCst};
-use mutator::{Mutator, LocalEpoch, Scope, unprotected};
+use mutator::{LocalEpoch, Scope, unprotected};
 use garbage::Bag;
 use epoch::Epoch;
-use sync::list::List;
+use sync::list::{List, Node};
 use sync::queue::Queue;
 
 
@@ -21,11 +20,11 @@ use sync::queue::Queue;
 /// # Examples
 ///
 /// ```
-/// use crossbeam_epoch as epoch;
+/// use crossbeam_epoch::{Collector, Mutator, MutatorImpl};
 ///
-/// let collector = epoch::Collector::new();
+/// let collector = Collector::new();
+/// let mutator = MutatorImpl::new(&collector);
 ///
-/// let mutator = collector.add_mutator();
 /// mutator.pin(|scope| {
 ///     scope.flush();
 /// });
@@ -56,6 +55,19 @@ impl Collector {
     #[inline]
     pub fn get_epoch(&self) -> usize {
         self.epoch.load(Relaxed)
+    }
+
+    /// Register a local epoch.
+    #[inline]
+    pub fn register_epoch<'scope>(&'scope self) -> &'scope Node<LocalEpoch> {
+        unsafe {
+            // Since we dereference no pointers in this block, it is safe to use `unprotected`.
+            unprotected(|scope| {
+                &*self.registries
+                    .insert_head(LocalEpoch::new(), scope)
+                    .as_raw()
+            })
+        }
     }
 
     /// Pushes the bag onto the global queue and replaces the bag with a new empty bag.
@@ -90,26 +102,6 @@ impl Collector {
                 None => break,
                 Some(bag) => drop(bag),
             }
-        }
-    }
-
-    /// Add a mutator.
-    pub fn add_mutator<'scope>(&'scope self) -> Mutator<'scope> {
-        let local_epoch = unsafe {
-            // Since we dereference no pointers in this block, it is safe to use `unprotected`.
-            unprotected(|scope| {
-                &*self.registries
-                    .insert_head(LocalEpoch::new(), scope)
-                    .as_raw()
-            })
-        };
-
-        Mutator {
-            collector: self,
-            bag: UnsafeCell::new(Bag::new()),
-            local_epoch: local_epoch,
-            is_pinned: Cell::new(false),
-            pin_count: Cell::new(0),
         }
     }
 }

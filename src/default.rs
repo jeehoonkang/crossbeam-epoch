@@ -5,7 +5,7 @@
 //! on thread exit, which in turn unregisters the thread.
 
 use collector::Collector;
-use mutator::{Mutator, Scope};
+use mutator::{Mutator, Impl as MutatorImpl, Scope};
 
 lazy_static! {
     /// The default global data.
@@ -15,8 +15,9 @@ lazy_static! {
 
 thread_local! {
     /// The thread-local mutator for the default global data.
-    static MUTATOR: Mutator<'static> = COLLECTOR.add_mutator();
+    static MUTATOR: MutatorImpl<'static> = MutatorImpl::new(&COLLECTOR);
 }
+
 
 /// Pin the current thread.
 pub fn pin<F, R>(f: F) -> R

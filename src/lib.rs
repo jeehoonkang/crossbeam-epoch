@@ -48,5 +48,5 @@ mod sync;
 
 pub use self::atomic::{Atomic, CompareAndSetOrdering, Owned, Ptr};
 pub use self::collector::Collector;
-pub use self::mutator::{Mutator, Scope, unprotected};
+pub use self::mutator::{Mutator, Inner as MutatorInner, Impl as MutatorImpl, Scope, unprotected};
 pub use self::default::{pin, is_pinned};
