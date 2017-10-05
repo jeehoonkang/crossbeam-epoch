@@ -103,9 +103,9 @@ impl Handle {
     /// it can be used pretty liberally. On a modern machine pinning takes 10 to 15 nanoseconds.
     ///
     /// [`Atomic`]: struct.Atomic.html
-    pub fn pin<F, R>(&self, f: F) -> R
+    pub fn pin<'scope, F, R>(&'scope self, f: F) -> R
     where
-        F: for<'scope> FnOnce(Scope<'scope>) -> R,
+        F: FnOnce(Scope<'scope>) -> R,
     {
         let local_epoch = unsafe { (*self.local_epoch).get() };
         let scope = Scope {
