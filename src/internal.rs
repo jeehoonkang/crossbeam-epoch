@@ -115,7 +115,7 @@ impl Global {
 #[derive(Debug)]
 pub struct Local {
     /// The local garbage objects that will be later freed.
-    bag: UnsafeCell<Bag>,
+    pub(crate) bag: UnsafeCell<Bag>,
     /// This participant's entry in the local epoch list.  It points to a node in `Global`, so it is
     /// alive as far as the `Global` is alive.
     local_epoch: *const Node<LocalEpoch>,
@@ -155,6 +155,86 @@ impl Local {
         }
     }
 
+    /// Returns `true` if the current participant is pinned.
+    #[inline]
+    pub fn is_pinned(&self) -> bool {
+        self.is_pinned.get()
+    }
+
+    /// FIXME
+    #[inline]
+    pub unsafe fn set_pinned(&self, global: &Global) -> bool {
+        let was_pinned = self.is_pinned.get();
+        if was_pinned {
+            return true;
+        }
+
+        // Increment the pin counter.
+        let count = self.pin_count.get();
+        self.pin_count.set(count.wrapping_add(1));
+
+        // Pin the participant.
+        self.is_pinned.set(true);
+        let epoch = global.get_epoch();
+        (*self.local_epoch).get().set_pinned(epoch);
+
+        // If the counter progressed enough, try advancing the epoch and collecting garbage.
+        if count % Self::PINS_BETWEEN_COLLECT == 0 {
+            let scope = Scope {
+                global,
+                bag: self.bag.get(),
+            };
+            global.collect(&scope);
+        }
+
+        false
+    }
+
+    /// FIXME
+    #[inline]
+    pub unsafe fn set_unpinned(&self, global: &Global) {
+        // Increment the pin counter.
+        let count = self.pin_count.get();
+        self.pin_count.set(count.wrapping_add(1));
+
+        // Unpin the participant.
+        (*self.local_epoch).get().set_unpinned();
+        self.is_pinned.set(false);
+
+        // If the counter progressed enough, try advancing the epoch and collecting garbage.
+        if count % Self::PINS_BETWEEN_COLLECT == 0 {
+            let scope = Scope {
+                global,
+                bag: self.bag.get(),
+            };
+            global.collect(&scope);
+        }
+    }
+
+    /// FIXME
+    #[inline]
+    pub unsafe fn set_repinned(&self, global: &Global) {
+        let was_pinned = self.is_pinned.get();
+        assert!(was_pinned, "Local::set_repinned(): it should have been pinned");
+
+        // Increment the pin counter.
+        let count = self.pin_count.get();
+        self.pin_count.set(count.wrapping_add(1));
+
+        // Repin the participant.
+        let epoch = global.get_epoch();
+        (*self.local_epoch).get().set_repinned(epoch);
+
+        // If the counter progressed enough, try advancing the epoch and collecting garbage.
+        if count % Self::PINS_BETWEEN_COLLECT == 0 {
+            let scope = Scope {
+                global,
+                bag: self.bag.get(),
+            };
+            global.collect(&scope);
+        }
+    }
+
     /// Pins the current participant, executes a function, and unpins the participant.
     ///
     /// The provided function takes a `Scope`, which can be used to interact with [`Atomic`]s. The
@@ -182,45 +262,20 @@ impl Local {
     where
         F: FnOnce(&Scope) -> R,
     {
-        let local_epoch = (*self.local_epoch).get();
+        let was_pinned = self.set_pinned(global);
         let scope = Scope {
             global,
             bag: self.bag.get(),
         };
 
-        let was_pinned = self.is_pinned.get();
-        if !was_pinned {
-            // Increment the pin counter.
-            let count = self.pin_count.get();
-            self.pin_count.set(count.wrapping_add(1));
-
-            // Pin the participant.
-            self.is_pinned.set(true);
-            let epoch = global.get_epoch();
-            local_epoch.set_pinned(epoch);
-
-            // If the counter progressed enough, try advancing the epoch and collecting garbage.
-            if count % Self::PINS_BETWEEN_COLLECT == 0 {
-                global.collect(&scope);
-            }
-        }
-
         // This will unpin the participant even if `f` panics.
         defer! {
             if !was_pinned {
-                // Unpin the participant.
-                local_epoch.set_unpinned();
-                self.is_pinned.set(false);
+                self.set_unpinned(global);
             }
         }
 
         f(&scope)
-    }
-
-    /// Returns `true` if the current participant is pinned.
-    #[inline]
-    pub fn is_pinned(&self) -> bool {
-        self.is_pinned.get()
     }
 
     /// Unregisters itself from the garbage collector.
@@ -293,5 +348,18 @@ impl LocalEpoch {
         // Clear the last bit.
         // We don't need to preserve the epoch, so just store the number zero.
         self.state.store(0, Ordering::Release);
+    }
+
+    /// Reset the participant as pinned.
+    ///
+    /// Must not be called if the participant is already pinned!
+    #[inline]
+    pub fn set_repinned(&self, epoch: usize) {
+        let old_epoch = self.state.load(Ordering::Relaxed);
+
+        if old_epoch != epoch {
+            let state = epoch | 1;
+            self.state.store(state, Ordering::Release);
+        }
     }
 }

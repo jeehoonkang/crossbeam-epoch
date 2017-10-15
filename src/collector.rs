@@ -16,6 +16,7 @@
 /// ```
 
 use std::sync::Arc;
+use std::ops::Deref;
 use internal::{Global, Local};
 use scope::Scope;
 
@@ -28,6 +29,13 @@ pub struct Handle {
     local: Local,
 }
 
+/// A QSBR handle to a garbage collector.
+pub struct QSBRHandle {
+    global: Arc<Global>,
+    local: Local,
+    scope: Scope,
+}
+
 impl Collector {
     /// Creates a new collector.
     pub fn new() -> Self {
@@ -38,6 +46,12 @@ impl Collector {
     #[inline]
     pub fn handle(&self) -> Handle {
         Handle::new(self.0.clone())
+    }
+
+    /// Creates a new QSBR handle for the collector.
+    #[inline]
+    pub fn qsbr_handle(&self) -> QSBRHandle {
+        QSBRHandle::new(self.0.clone())
     }
 }
 
@@ -69,6 +83,38 @@ impl Drop for Handle {
     }
 }
 
+impl QSBRHandle {
+    fn new(global: Arc<Global>) -> Self {
+        let local = Local::new(&global);
+        unsafe { local.set_pinned(&global); }
+        let scope = Scope {
+            global: global.deref() as *const _,
+            bag: local.bag.get(),
+        };
+        Self { global, local, scope }
+    }
+
+    pub unsafe fn on_quiescent_state(&self) {
+        self.local.set_repinned(&self.global);
+    }
+}
+
+impl Drop for QSBRHandle {
+    fn drop(&mut self) {
+        unsafe {
+            self.local.set_unpinned(&self.global);
+            self.local.unregister(&self.global);
+        }
+    }
+}
+
+impl Deref for QSBRHandle {
+    type Target = Scope;
+
+    fn deref(&self) -> &Self::Target {
+        &self.scope
+    }
+}
 
 #[cfg(test)]
 mod tests {
