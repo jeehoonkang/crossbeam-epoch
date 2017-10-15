@@ -16,6 +16,7 @@
 /// ```
 
 use std::sync::Arc;
+use std::ops::Deref;
 use internal::{Global, Local};
 use scope::Scope;
 
@@ -28,6 +29,13 @@ pub struct Handle {
     local: Local,
 }
 
+/// A RAII-style guard to a garbage collector.
+pub struct Guard {
+    global: Arc<Global>,
+    local: Local,
+    scope: Scope,
+}
+
 impl Collector {
     /// Creates a new collector.
     pub fn new() -> Self {
@@ -38,6 +46,12 @@ impl Collector {
     #[inline]
     pub fn handle(&self) -> Handle {
         Handle::new(self.0.clone())
+    }
+
+    /// Creates a new guard for the collector.
+    #[inline]
+    pub fn guard(&self) -> Guard {
+        Guard::new(self.0.clone())
     }
 }
 
@@ -69,6 +83,38 @@ impl Drop for Handle {
     }
 }
 
+impl Guard {
+    fn new(global: Arc<Global>) -> Self {
+        let local = Local::new(&global);
+        let scope = Scope {
+            global: global.deref() as *const _,
+            bag: local.bag.get(),
+        };
+        unsafe { local.set_pinned(&global); }
+        Self { global, local, scope }
+    }
+
+    pub unsafe fn safepoint(&self) {
+        self.local.set_repinned(&self.global);
+    }
+}
+
+impl Drop for Guard {
+    fn drop(&mut self) {
+        unsafe {
+            self.local.unregister(&self.global);
+            self.local.set_unpinned(&self.global);
+        }
+    }
+}
+
+impl Deref for Guard {
+    type Target = Scope;
+
+    fn deref(&self) -> &Self::Target {
+        &self.scope
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -385,4 +431,35 @@ mod tests {
         }
         assert_eq!(DROPS.load(Ordering::Relaxed), COUNT * THREADS);
     }
+
+    // #[test]
+    // fn guard() {
+    //     const COUNT: usize = 100_000;
+    //     static DROPS: AtomicUsize = ATOMIC_USIZE_INIT;
+
+    //     struct Elem(i32);
+
+    //     impl Drop for Elem {
+    //         fn drop(&mut self) {
+    //             DROPS.fetch_add(1, Ordering::Relaxed);
+    //         }
+    //     }
+
+    //     let collector = Collector::new();
+
+    //     unsafe {
+    //         let guard = collector.guard();
+    //         for _ in 0..COUNT {
+    //             let a = Owned::new(Elem(7i32)).into_ptr(&guard);
+    //             guard.defer(move || a.into_owned());
+    //         }
+    //         guard.flush();
+    //     }
+
+    //     while DROPS.load(Ordering::Relaxed) < COUNT {
+    //         collector.0.collect(&collector.guard());
+    //     }
+
+    //     assert_eq!(DROPS.load(Ordering::Relaxed), COUNT);
+    // }
 }
