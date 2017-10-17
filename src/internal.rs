@@ -34,6 +34,7 @@
 
 use std::cell::{Cell, UnsafeCell};
 use std::cmp;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use scope::{Scope, unprotected};
 use garbage::Bag;
@@ -114,13 +115,15 @@ impl Global {
 /// Participant for garbage collection
 #[derive(Debug)]
 pub struct Local {
+    /// The global data.
+    global: Arc<Global>,
     /// The local garbage objects that will be later freed.
     bag: UnsafeCell<Bag>,
     /// This participant's entry in the local epoch list.  It points to a node in `Global`, so it is
     /// alive as far as the `Global` is alive.
     local_epoch: *const Node<LocalEpoch>,
-    /// Whether the participant is currently pinned.
-    is_pinned: Cell<bool>,
+    /// The depth of pins.
+    pin_depth: Cell<usize>,
     /// Total number of pinnings performed.
     pin_count: Cell<usize>,
 }
@@ -139,7 +142,7 @@ impl Local {
 
     /// Creates a participant to the garbage collection global data.
     #[inline]
-    pub fn new(global: &Global) -> Self {
+    pub fn new(global: Arc<Global>) -> Self {
         let local_epoch = unsafe {
             // Since we dereference no pointers in this block, it is safe to use `unprotected`.
             unprotected(|scope| {
@@ -148,11 +151,59 @@ impl Local {
         };
 
         Self {
+            global,
             bag: UnsafeCell::new(Bag::new()),
             local_epoch,
-            is_pinned: Cell::new(false),
+            pin_depth: Cell::new(0),
             pin_count: Cell::new(0),
         }
+    }
+
+    /// FIXME
+    pub unsafe fn scope(&self) -> Scope {
+        Scope {
+            global: self.global.as_ref() as *const _,
+            bag: self.bag.get(),
+        }
+    }
+
+    /// FIXME
+    pub unsafe fn set_pinned(&self) {
+        let pin_depth = self.pin_depth.get();
+        self.pin_depth.set(pin_depth.wrapping_add(1));
+
+        let count = self.pin_count.get();
+        self.pin_count.set(count.wrapping_add(1));
+
+        if pin_depth == 0 {
+            // Pin the participant.
+            let epoch = self.global.get_epoch();
+            let local_epoch = (*self.local_epoch).get();
+            local_epoch.set_pinned(epoch);
+
+            // If the counter progressed enough, try advancing the epoch and collecting garbage.
+            if count % Self::PINS_BETWEEN_COLLECT == 0 {
+                self.global.collect(&self.scope());
+            }
+        }
+    }
+
+    /// FIXME
+    pub unsafe fn set_unpinned(&self) {
+        let pin_depth = self.pin_depth.get();
+        self.pin_depth.set(pin_depth.wrapping_sub(1));
+
+        if pin_depth == 1 {
+            // Unpin the participant.
+            let local_epoch = (*self.local_epoch).get();
+            local_epoch.set_unpinned();
+        }
+    }
+
+    /// Returns `true` if the current participant is pinned.
+    #[inline]
+    pub fn is_pinned(&self) -> bool {
+        self.pin_depth.get() != 0
     }
 
     /// Pins the current participant, executes a function, and unpins the participant.
@@ -178,51 +229,22 @@ impl Local {
     /// undefined.
     ///
     /// [`Atomic`]: struct.Atomic.html
-    pub unsafe fn pin<F, R>(&self, global: &Global, f: F) -> R
+    pub fn pin<F, R>(&self, f: F) -> R
     where
         F: FnOnce(&Scope) -> R,
     {
-        let local_epoch = (*self.local_epoch).get();
-        let scope = Scope {
-            global,
-            bag: self.bag.get(),
-        };
+        unsafe {
+            self.set_pinned();
 
-        let was_pinned = self.is_pinned.get();
-        if !was_pinned {
-            // Increment the pin counter.
-            let count = self.pin_count.get();
-            self.pin_count.set(count.wrapping_add(1));
+            // This will unpin the participant even if `f` panics.
+            defer! { self.set_unpinned() }
 
-            // Pin the participant.
-            self.is_pinned.set(true);
-            let epoch = global.get_epoch();
-            local_epoch.set_pinned(epoch);
-
-            // If the counter progressed enough, try advancing the epoch and collecting garbage.
-            if count % Self::PINS_BETWEEN_COLLECT == 0 {
-                global.collect(&scope);
-            }
+            f(&self.scope())
         }
-
-        // This will unpin the participant even if `f` panics.
-        defer! {
-            if !was_pinned {
-                // Unpin the participant.
-                local_epoch.set_unpinned();
-                self.is_pinned.set(false);
-            }
-        }
-
-        f(&scope)
     }
+}
 
-    /// Returns `true` if the current participant is pinned.
-    #[inline]
-    pub fn is_pinned(&self) -> bool {
-        self.is_pinned.get()
-    }
-
+impl Drop for Local {
     /// Unregisters itself from the garbage collector.
     ///
     /// # Safety
@@ -230,20 +252,20 @@ impl Local {
     /// You should pass `global` that is used to create this `Local`. Also, a `Local` should be
     /// unregistered once, and after it is unregistered it should not be `pin()`ned. Otherwise, the
     /// behavior is undefined.
-    pub unsafe fn unregister(&self, global: &Global) {
+    fn drop(&mut self) {
         // Now that the participant is exiting, we must move the local bag into the global garbage
         // queue. Also, let's try advancing the epoch and help free some garbage.
 
-        self.pin(global, |scope| {
+        self.pin(|scope| unsafe {
             // Spare some cycles on garbage collection.
-            global.collect(scope);
+            self.global.collect(scope);
 
             // Unregister the participant by marking this entry as deleted.
             (*self.local_epoch).delete(scope);
 
             // Push the local bag into the global garbage queue.
-            global.push_bag(&mut *self.bag.get(), scope);
-        });
+            self.global.push_bag(&mut *self.bag.get(), scope);
+        })
     }
 }
 

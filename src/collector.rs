@@ -15,6 +15,8 @@
 /// });
 /// ```
 
+use std::ops::Deref;
+use std::rc::Rc;
 use std::sync::Arc;
 use internal::{Global, Local};
 use scope::Scope;
@@ -23,9 +25,12 @@ use scope::Scope;
 pub struct Collector(Arc<Global>);
 
 /// A handle to a garbage collector.
-pub struct Handle {
-    global: Arc<Global>,
-    local: Local,
+pub struct Handle(Rc<Local>);
+
+/// A RAII-style guard to a garbage collector.
+pub struct Guard {
+    local: Rc<Local>,
+    scope: Scope,
 }
 
 impl Collector {
@@ -43,8 +48,7 @@ impl Collector {
 
 impl Handle {
     fn new(global: Arc<Global>) -> Self {
-        let local = Local::new(&global);
-        Self { global, local }
+        Self { 0: Rc::new(Local::new(global)) }
     }
 
     /// Pin the current handle.
@@ -53,19 +57,34 @@ impl Handle {
     where
         F: FnOnce(&Scope) -> R,
     {
-        unsafe { self.local.pin(&self.global, f) }
+        self.0.pin(f)
     }
 
     /// Check if the current handle is pinned.
     #[inline]
     pub fn is_pinned(&self) -> bool {
-        self.local.is_pinned()
+        self.0.is_pinned()
+    }
+
+    pub fn guard(&self) -> Guard {
+        Guard {
+            local: self.0.clone(),
+            scope: unsafe { self.0.scope() },
+        }
     }
 }
 
-impl Drop for Handle {
+impl Deref for Guard {
+    type Target = Scope;
+
+    fn deref(&self) -> &Self::Target {
+        &self.scope
+    }
+}
+
+impl Drop for Guard {
     fn drop(&mut self) {
-        unsafe { self.local.unregister(&self.global) }
+        unsafe { self.local.set_unpinned(); }
     }
 }
 
@@ -384,5 +403,41 @@ mod tests {
             handle.pin(|scope| collector.0.collect(scope));
         }
         assert_eq!(DROPS.load(Ordering::Relaxed), COUNT * THREADS);
+    }
+
+    #[test]
+    fn guard() {
+        const COUNT: usize = 100_000;
+        static DROPS: AtomicUsize = ATOMIC_USIZE_INIT;
+
+        struct Elem(i32);
+
+        impl Drop for Elem {
+            fn drop(&mut self) {
+                DROPS.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
+        let collector = Collector::new();
+        let handle = collector.handle();
+
+        unsafe {
+            let guard = handle.guard();
+            for _ in 0..COUNT {
+                let a = Owned::new(Elem(7i32)).into_ptr(&guard);
+                guard.defer(move || a.into_owned());
+            }
+            guard.flush();
+        }
+
+        while DROPS.load(Ordering::Relaxed) < COUNT {
+            handle.pin(|scope| collector.0.collect(scope));
+        }
+
+        let guard = handle.guard();
+        drop(handle);
+        collector.0.collect(&guard);
+
+        assert_eq!(DROPS.load(Ordering::Relaxed), COUNT);
     }
 }
