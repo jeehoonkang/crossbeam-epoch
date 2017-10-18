@@ -683,6 +683,23 @@ impl<T> Owned<T> {
         Ptr::from_data(data)
     }
 
+    /// Converts the owned pointer to the inner value.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use crossbeam_epoch::{self as epoch, Owned};
+    ///
+    /// let o = Owned::new(1234);
+    /// assert_eq!(o.into_inner(), 1234);
+    /// ```
+    ///
+    /// [`Ptr`]: struct.Ptr.html
+    pub fn into_inner(self) -> T {
+        let raw = (self.data & !low_bits::<T>()) as *mut T;
+        unsafe { *Box::from_raw(raw) }
+    }
+
     /// Returns the tag stored within the pointer.
     ///
     /// # Examples
