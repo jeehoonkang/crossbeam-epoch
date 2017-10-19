@@ -817,6 +817,20 @@ impl<'scope, T> Clone for Ptr<'scope, T> {
 
 impl<'scope, T> Copy for Ptr<'scope, T> {}
 
+impl<'scope, T> Default for Ptr<'scope, T> {
+    fn default() -> Self {
+        Ptr::null()
+    }
+}
+
+impl<'scope, T> PartialEq for Ptr<'scope, T> {
+    fn eq(&self, other: &Self) -> bool {
+        self.data == other.data
+    }
+}
+
+impl<'scope, T> Eq for Ptr<'scope, T> {}
+
 impl<'scope, T> Ptr<'scope, T> {
     /// Returns a new pointer pointing to the tagged pointer `data`.
     fn from_data(data: usize) -> Self {
@@ -1044,12 +1058,6 @@ impl<'scope, T> Ptr<'scope, T> {
     }
 }
 
-impl<'scope, T> Default for Ptr<'scope, T> {
-    fn default() -> Self {
-        Ptr::null()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::Ptr;
@@ -1062,5 +1070,10 @@ mod tests {
     #[test]
     fn valid_tag_i64() {
         Ptr::<i64>::null().with_tag(7);
+    }
+
+    #[test]
+    fn ptr_eq() {
+        assert_eq!(Ptr::<usize>::null(), Ptr::<usize>::null());
     }
 }
