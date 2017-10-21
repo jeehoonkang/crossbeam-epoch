@@ -9,11 +9,10 @@
 
 use std::ops::Deref;
 use std::sync::atomic::AtomicUsize;
-use std::sync::atomic::Ordering::{Relaxed, Acquire, Release, SeqCst};
+use std::sync::atomic::Ordering::{Relaxed, Acquire, AcqRel, Release, SeqCst};
 
-use internal::LocalEpoch;
-use scope::Scope;
-use sync::list::{List, IterError};
+use guard::Guard;
+use internal::Global;
 use crossbeam_utils::cache_padded::CachePadded;
 
 /// The global epoch is a (cache-padded) integer.
@@ -36,30 +35,51 @@ impl Epoch {
     ///
     /// `try_advance()` is annotated `#[cold]` because it is rarely called.
     #[cold]
-    pub fn try_advance(&self, registries: &List<LocalEpoch>, scope: &Scope) -> usize {
+    pub fn try_advance(&self, global: &Global, guard: &Guard) -> usize {
         let epoch = self.epoch.load(Relaxed);
         ::std::sync::atomic::fence(SeqCst);
 
-        // Traverse the linked list of participant registries.
-        for participant in registries.iter(scope) {
-            match participant {
-                Err(IterError::LostRace) => {
-                    // We leave the job to the participant that won the race, which continues to
-                    // iterate the registries and tries to advance to epoch.
+        let mut pred = &global.registries;
+        let mut curr = pred.load(Acquire, guard);
+
+        while let Some(c) = unsafe { curr.as_ref() } {
+            let succ = c.next.load(Acquire, guard);
+
+            if succ.tag() == 1 && !c.local.local_epoch.get_state().0 {
+                // This thread has exited. Try unlinking it from the list.
+                let succ = succ.with_tag(0);
+
+                if pred.compare_and_set(curr, succ, AcqRel, guard).is_err() {
+                    // We lost the race to unlink the thread. Usually that means we should traverse the
+                    // list again from the beginning, but since another thread trying to advance the
+                    // epoch has won the race, we leave the job to that one.
                     return epoch;
                 }
-                Ok(local_epoch) => {
-                    let local_epoch = local_epoch.get();
-                    let (participant_is_pinned, participant_epoch) = local_epoch.get_state();
 
-                    // If the participant was pinned in a different epoch, we cannot advance the
-                    // global epoch just yet.
-                    if participant_is_pinned && participant_epoch != epoch {
-                        return epoch;
-                    }
+                // The unlinked entry can later be freed.
+                unsafe {
+                    global.push_bag(&mut *c.local.bag.get(), guard);
+                    global.collect(guard);
+                    guard.defer(move || curr.into_owned())
                 }
+
+                // Move forward, but don't change the predecessor.
+                curr = succ;
+            } else {
+                let (participant_is_pinned, participant_epoch) = c.local.local_epoch.get_state();
+
+                // If the participant was pinned in a different epoch, we cannot advance the global
+                // epoch just yet.
+                if participant_is_pinned && participant_epoch != epoch {
+                    return epoch;
+                }
+
+                // Move one step forward.
+                pred = &c.next;
+                curr = succ;
             }
         }
+
         ::std::sync::atomic::fence(Acquire);
 
         // All pinned participants were pinned in the current global epoch.  Try advancing the
