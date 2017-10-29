@@ -4,10 +4,9 @@
 //! http://dl.acm.org/citation.cfm?id=564870.564881
 
 use std::sync::atomic::Ordering::{Acquire, Relaxed, Release};
-
-use {Atomic, Owned, Ptr, Scope, unprotected};
 use crossbeam_utils::cache_padded::CachePadded;
 
+use {Atomic, Ptr, Guard, unprotected};
 
 /// An entry in the linked list.
 struct NodeInner<T> {
@@ -31,7 +30,7 @@ pub struct List<T> {
 
 pub struct Iter<'scope, T: 'scope> {
     /// The scope in which the iterator is operating.
-    scope: &'scope Scope,
+    scope: &'scope Guard,
 
     /// Pointer from the predecessor to the current entry.
     pred: &'scope Atomic<Node<T>>,
@@ -48,7 +47,7 @@ pub enum IterError {
 
 impl<T> Node<T> {
     /// Returns the data in this entry.
-    fn new(data: T) -> Self {
+    pub fn new(data: T) -> Self {
         Node(CachePadded::new(NodeInner {
             data,
             next: Atomic::null(),
@@ -62,7 +61,7 @@ impl<T> Node<T> {
 
 impl<T: 'static> Node<T> {
     /// Marks this entry as deleted.
-    pub fn delete(&self, scope: &Scope) {
+    pub fn delete(&self, scope: &Guard) {
         self.0.next.fetch_or(1, Release, scope);
     }
 }
@@ -77,27 +76,24 @@ impl<T> List<T> {
     #[inline]
     fn insert_internal<'scope>(
         to: &'scope Atomic<Node<T>>,
-        data: T,
-        scope: &'scope Scope,
-    ) -> Ptr<'scope, Node<T>> {
-        let mut cur = Owned::new(Node::new(data));
+        cur: &'scope Node<T>,
+        scope: &'scope Guard,
+    ) {
+        let cur_ptr = Ptr::from_raw(cur as *const _);
         let mut next = to.load(Relaxed, scope);
 
         loop {
             cur.0.next.store(next, Relaxed);
-            match to.compare_and_set_weak_owned(next, cur, Release, scope) {
+            match to.compare_and_set_weak(next, cur_ptr, Release, scope) {
                 Ok(cur) => return cur,
-                Err((n, c)) => {
-                    next = n;
-                    cur = c;
-                }
+                Err(n) => next = n,
             }
         }
     }
 
     /// Inserts `data` into the head of the list.
     #[inline]
-    pub fn insert<'scope>(&'scope self, data: T, scope: &'scope Scope) -> Ptr<'scope, Node<T>> {
+    pub fn insert<'scope>(&'scope self, data: &'scope Node<T>, scope: &'scope Guard) {
         Self::insert_internal(&self.head, data, scope)
     }
 
@@ -107,9 +103,9 @@ impl<T> List<T> {
     pub fn insert_after<'scope>(
         &'scope self,
         after: &'scope Atomic<Node<T>>,
-        data: T,
-        scope: &'scope Scope,
-    ) -> Ptr<'scope, Node<T>> {
+        data: &'scope Node<T>,
+        scope: &'scope Guard,
+    ) {
         Self::insert_internal(after, data, scope)
     }
 
@@ -124,7 +120,7 @@ impl<T> List<T> {
     /// 1. If a new datum is inserted during iteration, it may or may not be returned.
     /// 2. If a datum is deleted during iteration, it may or may not be returned.
     /// 3. It may not return all data if a concurrent thread continues to iterate the same list.
-    pub fn iter<'scope>(&'scope self, scope: &'scope Scope) -> Iter<'scope, T> {
+    pub fn iter<'scope>(&'scope self, scope: &'scope Guard) -> Iter<'scope, T> {
         let pred = &self.head;
         let curr = pred.load(Acquire, scope);
         Iter { scope, pred, curr }
@@ -134,14 +130,13 @@ impl<T> List<T> {
 impl<T> Drop for List<T> {
     fn drop(&mut self) {
         unsafe {
-            unprotected(|scope| {
-                let mut curr = self.head.load(Relaxed, scope);
-                while let Some(c) = curr.as_ref() {
-                    let succ = c.0.next.load(Relaxed, scope);
-                    drop(curr.into_owned());
-                    curr = succ;
-                }
-            });
+            let guard = unprotected();
+            let mut curr = self.head.load(Relaxed, &guard);
+            while let Some(c) = curr.as_ref() {
+                let succ = c.0.next.load(Relaxed, &guard);
+                drop(curr.into_owned());
+                curr = succ;
+            }
         }
     }
 }
@@ -213,24 +208,27 @@ mod tests {
         let collector = Collector::new();
         let handle = collector.handle();
 
-        handle.pin(|scope| {
-            let p2 = l.insert(2, scope);
-            let n2 = unsafe { p2.as_ref().unwrap() };
-            let _p3 = l.insert_after(&n2.0.next, 3, scope);
-            let _p1 = l.insert(1, scope);
+        let guard = handle.pin();
 
-            let mut iter = l.iter(scope);
-            assert!(iter.next().is_some());
-            assert!(iter.next().is_some());
-            assert!(iter.next().is_some());
-            assert!(iter.next().is_none());
+        let n1 = Node::new(1);
+        let n2 = Node::new(2);
+        let n3 = Node::new(3);
 
-            n2.delete(scope);
+        l.insert(&n2, &guard);
+        let _p3 = l.insert_after(&n2.0.next, &n3, &guard);
+        let _p1 = l.insert(&n1, &guard);
 
-            let mut iter = l.iter(scope);
-            assert!(iter.next().is_some());
-            assert!(iter.next().is_some());
-            assert!(iter.next().is_none());
-        });
+        let mut iter = l.iter(&guard);
+        assert!(iter.next().is_some());
+        assert!(iter.next().is_some());
+        assert!(iter.next().is_some());
+        assert!(iter.next().is_none());
+
+        n2.delete(&guard);
+
+        let mut iter = l.iter(&guard);
+        assert!(iter.next().is_some());
+        assert!(iter.next().is_some());
+        assert!(iter.next().is_none());
     }
 }
