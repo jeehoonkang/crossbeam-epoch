@@ -428,7 +428,7 @@ mod tests {
             .map(|_| {
                 scoped::scope(|scope| {
                     let handle = handle_global.clone();
-                    scope.spawn(move || handle.pin(|scope| scope.flush()))
+                    scope.spawn(move || handle.pin().flush())
                 })
             })
             .collect::<Vec<_>>();
