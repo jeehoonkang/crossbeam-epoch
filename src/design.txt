@@ -1,0 +1,7 @@
+Global
+Local
+
+Collector
+Handle
+Scope
+ScopeGuard

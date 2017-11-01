@@ -5,7 +5,7 @@
 //! destructed on thread exit, which in turn unregisters the thread.
 
 use collector::{Collector, Handle};
-use internal::Guard;
+use collector::Guard;
 
 lazy_static! {
     /// The global data for the default garbage collector.

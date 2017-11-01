@@ -15,17 +15,44 @@
 /// });
 /// ```
 
+use std::cell::Cell;
+use std::ptr;
 use std::sync::Arc;
 
-use internal::{Global, Local, Guard};
+use garbage::Garbage;
+use internal::{Global, Local};
 
 /// An epoch-based garbage collector.
 pub struct Collector(Arc<Global>);
 
+struct LocalBox {
+    local: Local,
+    num_guards: Cell<usize>,
+    num_handles: Cell<usize>,
+}
+
 /// A handle to a garbage collector.
 pub struct Handle {
     global: Arc<Global>,
-    local: *const Local,
+    local: *const LocalBox, // !Send + !Sync
+}
+
+/// A witness that the current participant is pinned.
+///
+/// A `Guard` is a witness that the current participant is pinned. Lots of methods that interact
+/// with [`Atomic`]s can safely be called only while the participant is pinned so they often require
+/// a `&Guard`.
+///
+/// This data type is inherently bound to the thread that created it, therefore it does not
+/// implement `Send` nor `Sync`.
+///
+/// [`Atomic`]: struct.Atomic.html
+#[derive(Debug)]
+pub struct Guard {
+    /// A reference to the global data.
+    global: *const Global,
+    /// A reference to the thread-local data.
+    local: *const LocalBox, // !Send + !Sync
 }
 
 impl Collector {
@@ -85,6 +112,102 @@ impl Drop for Handle {
                 local.unregister(&self.global);
             }
         }
+    }
+}
+
+impl Guard {
+    unsafe fn defer_garbage(&self, mut garbage: Garbage) {
+        self.global.as_ref().map(|global| {
+            let bag = &mut *(*self.local).bag.get();
+            while let Err(g) = bag.try_push(garbage) {
+                global.push_bag(bag, self);
+                garbage = g;
+            }
+        });
+    }
+
+    /// Deferred execution of an arbitrary function `f`.
+    ///
+    /// This function inserts the function into a thread-local [`Bag`]. When the bag becomes full,
+    /// the bag is flushed into the globally shared queue of bags.
+    ///
+    /// If this function is destroying a particularly large object, it is wise to follow up with a
+    /// call to [`flush`] so that it doesn't get stuck waiting in the thread-local bag for a long
+    /// time.
+    ///
+    /// [`Bag`]: struct.Bag.html
+    /// [`flush`]: fn.flush.html
+    pub unsafe fn defer<R, F: FnOnce() -> R + Send>(&self, f: F) {
+        self.defer_garbage(Garbage::new(|| drop(f())))
+    }
+
+    /// Flushes all garbage in the thread-local storage into the global garbage queue, attempts to
+    /// advance the epoch, and collects some garbage.
+    ///
+    /// Even though flushing can be explicitly called, it is also automatically triggered when the
+    /// thread-local storage fills up or when we pin the current participant a specific number of
+    /// times.
+    ///
+    /// It is wise to flush the bag just after `defer`ring the deallocation of a very large object,
+    /// so that it isn't sitting in the thread-local bag for a long time.
+    ///
+    /// [`defer`]: fn.defer.html
+    pub fn flush(&self) {
+        unsafe {
+            self.global.as_ref().map(|global| {
+                let bag = &mut *(*self.local).bag.get();
+
+                if !bag.is_empty() {
+                    global.push_bag(bag, &self);
+                }
+
+                global.collect(&self);
+            });
+        }
+    }
+}
+
+impl Drop for Guard {
+    fn drop(&mut self) {
+        if !self.local.is_null() {
+            unsafe {
+                let local = &*self.local;
+                let num_guards = local.num_guards.get();
+                local.num_guards.set(num_guards - 1);
+
+                if num_guards == 1 {
+                    // Mark this participant as unpinned.
+                    local.local_epoch.get().set_unpinned();
+
+                    if local.num_handles.get() == 0 {
+                        // There are no more guards and handles. Unregister the local data.
+                        local.unregister(&*self.global);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Returns a [`Scope`] without pinning any participant.
+///
+/// Sometimes, we'd like to have longer-lived scopes in which we know our thread can access atomics
+/// without protection. This is true e.g. when deallocating a big data structure, or when
+/// constructing it from a long iterator. In such cases we don't need to be overprotective because
+/// there is no fear of other threads concurrently destroying objects.
+///
+/// Function `unprotected` is *unsafe* because we must promise that (1) the locations that we access
+/// should not be deallocated by concurrent participants, and (2) the locations that we deallocate
+/// should not be accessed by concurrent participants.
+///
+/// Just like with the safe epoch::pin function, unprotected use of atomics is enclosed within a
+/// scope so that pointers created within it don't leak out or get mixed with pointers from other
+/// scopes.
+#[inline]
+pub unsafe fn unprotected() -> Guard {
+    Guard {
+        global: ptr::null(),
+        local: ptr::null(),
     }
 }
 
@@ -447,3 +570,58 @@ mod tests {
         }
     }
 }
+
+
+    // /// Total number of pinnings performed.
+    // pin_count: Cell<usize>,
+    // /// How many handles out there?
+    // pub num_handles: Cell<usize>,
+    // /// How many times it is pinned?
+    // pub num_guards: Cell<usize>,
+
+
+    //         pin_count: Cell::new(0),
+    //         num_guards: Cell::new(0),
+    //         num_handles: Cell::new(0),
+
+
+    // /// Number of pinnings after which a participant will collect some global garbage.
+    // const PINS_BETWEEN_COLLECT: usize = 128;
+
+
+
+    // pub unsafe fn pin(&self, global: &Global) -> Guard {
+    //     let guard = Guard {
+    //         global,
+    //         local: self,
+    //     };
+
+    //     let num_guards = self.num_guards.get(); 
+    //     self.num_guards.set(num_guards + 1);
+
+    //     if num_guards == 0 {
+    //         // Increment the pin counter.
+    //         let count = self.pin_count.get();
+    //         self.pin_count.set(count.wrapping_add(1));
+
+    //         // Mark this participant as pinned.
+    //         let epoch = global.get_epoch();
+    //         self.local_epoch.get().set_pinned(epoch);
+
+    //         // If the counter progressed enough, try advancing the epoch and collecting garbage.
+    //         if count % Self::PINS_BETWEEN_COLLECT << 1 == 0 {
+    //             global.collect(&guard);
+    //         }
+    //     }
+
+    //     guard
+    // }
+
+
+
+            
+    // /// Returns `true` if the current participant is pinned.
+    // #[inline]
+    // pub fn is_pinned(&self) -> bool {
+    //     self.num_guards.get() > 0
+    // }

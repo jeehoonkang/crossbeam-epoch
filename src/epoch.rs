@@ -11,7 +11,7 @@ use std::ops::Deref;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 
-use internal::Guard;
+use collector::Guard;
 use sync::list::{List, IterError};
 use crossbeam_utils::cache_padded::CachePadded;
 
