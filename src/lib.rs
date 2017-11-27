@@ -89,11 +89,14 @@ mod default;
 mod deferred;
 mod epoch;
 mod guard;
+mod shield;
 mod internal;
 mod sync;
 
 pub use self::atomic::{Atomic, CompareAndSetError, CompareAndSetOrdering, Owned, Shared, Pointer};
 pub use self::guard::{unprotected, Guard};
+pub use self::shield::{Shield};
 #[cfg(feature = "use_std")]
-pub use self::default::{default_collector, is_pinned, pin};
+pub use self::default::{default_collector, default_handle, is_pinned, pin};
 pub use self::collector::{Collector, LocalHandle};
+pub use self::sync::atomic_box::AtomicBox;

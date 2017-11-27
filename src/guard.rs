@@ -6,6 +6,7 @@ use atomic::Shared;
 use collector::Collector;
 use deferred::Deferred;
 use internal::Local;
+use shield::Shield;
 
 /// A guard that keeps the current thread pinned.
 ///
@@ -421,6 +422,13 @@ impl Guard {
     /// [`unprotected`]: fn.unprotected.html
     pub fn collector(&self) -> Option<&Collector> {
         unsafe { self.local.as_ref().map(|local| local.collector()) }
+    }
+
+    /// FIXME
+    pub fn shield<'g, T>(&'g self, shared: Shared<'g, T>) -> Option<Shield<T>> {
+        unsafe { self.local.as_ref() }.and_then(|local| {
+            local.acquire_shield(shared)
+        })
     }
 }
 

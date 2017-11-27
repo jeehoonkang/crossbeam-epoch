@@ -16,7 +16,7 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 #[derive(Copy, Clone, Default, Debug, Eq, PartialEq)]
 pub struct Epoch {
     /// The least significant bit is set if pinned. The rest of the bits hold the epoch.
-    data: usize,
+    pub(crate) data: usize,
 }
 
 impl Epoch {

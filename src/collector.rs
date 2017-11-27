@@ -145,7 +145,7 @@ mod tests {
 
                 assert!(!(*(*guard.local).bag.get()).is_empty());
 
-                while !(*(*guard.local).bag.get()).is_empty() {
+                if !(*(*guard.local).bag.get()).is_empty() {
                     guard.flush();
                 }
             }
@@ -223,6 +223,8 @@ mod tests {
         assert!(DESTROYS.load(Ordering::Relaxed) == 100_000);
     }
 
+    // FIXME: global.collect() creates and destroys hazard sets so that DESTROYS will be
+    // incremented.  We need to change the test code..
     #[test]
     fn buffering() {
         const COUNT: usize = 10;
@@ -245,6 +247,7 @@ mod tests {
         for _ in 0..100_000 {
             collector.global.collect(&handle.pin());
         }
+
         assert!(DESTROYS.load(Ordering::Relaxed) < COUNT);
 
         handle.pin().flush();

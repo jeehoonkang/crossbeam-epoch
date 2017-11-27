@@ -35,6 +35,9 @@
 //! Ideally each instance of concurrent data structure may have its own queue that gets fully
 //! destroyed as soon as the data structure gets dropped.
 
+/// FIXME
+use std::collections::HashSet;
+
 use core::cell::{Cell, UnsafeCell};
 use core::mem::{self, ManuallyDrop};
 use core::num::Wrapping;
@@ -46,13 +49,15 @@ use alloc::boxed::Box;
 use crossbeam_utils::CachePadded;
 use arrayvec::ArrayVec;
 
-use atomic::Owned;
+use atomic::{Pointer, Owned, Shared};
 use collector::{LocalHandle, Collector};
 use epoch::{AtomicEpoch, Epoch};
 use guard::{unprotected, Guard};
 use deferred::Deferred;
+use shield::{Shields, Shield};
 use sync::list::{List, Entry, IterError, IsElement};
 use sync::queue::Queue;
+use sync::atomic_box::AtomicBox;
 
 /// Maximum number of objects a bag can contain.
 #[cfg(not(feature = "sanitize"))]
@@ -137,6 +142,9 @@ pub struct Global {
 
     /// The global epoch.
     pub(crate) epoch: CachePadded<AtomicEpoch>,
+
+    /// The sets of hazard pointers for each epoch.
+    hazards: [AtomicBox<HashSet<usize>>; 4],
 }
 
 impl Global {
@@ -150,6 +158,7 @@ impl Global {
             locals: List::new(),
             queue: Queue::new(),
             epoch: CachePadded::new(AtomicEpoch::new(Epoch::starting())),
+            hazards: Default::default(),
         }
     }
 
@@ -169,6 +178,7 @@ impl Global {
     #[cold]
     pub fn collect(&self, guard: &Guard) {
         let global_epoch = self.try_advance(guard);
+        let hazards = self.hazards[(global_epoch.data >> 1) % 4].get(guard);
 
         let steps = if cfg!(feature = "sanitize") {
             usize::max_value()
@@ -176,6 +186,7 @@ impl Global {
             Self::COLLECT_STEPS
         };
 
+        let mut survived_hazards: HashSet<(usize, unsafe fn(usize))> = HashSet::new();
         for _ in 0..steps {
             match self.queue.try_pop_if(
                 &|sealed_bag: &SealedBag| sealed_bag.is_expired(global_epoch),
@@ -183,8 +194,28 @@ impl Global {
             )
             {
                 None => break,
-                Some(sealed_bag) => drop(sealed_bag),
+                Some(sealed_bag) => {
+                    drop(sealed_bag);
+
+                    // TODO
+                    // bag.dispose(&mut |object: usize, drop: unsafe fn(usize)| {
+                    //     if hazards.map(|h| h.contains(&object)).unwrap_or(false) {
+                    //         survived_hazards.insert((object, drop));
+                    //     } else {
+                    //         unsafe { drop(object); }
+                    //     }
+                    // });
+                }
             }
+        }
+
+        unsafe {
+            guard.defer(move || {
+                for (object, drop) in survived_hazards {
+                    // TODO
+                    // try_drop(object, drop);
+                }
+            });
         }
     }
 
@@ -200,6 +231,8 @@ impl Global {
     pub fn try_advance(&self, guard: &Guard) -> Epoch {
         let global_epoch = self.epoch.load(Ordering::Relaxed);
         atomic::fence(Ordering::SeqCst);
+
+        let mut hazards = HashSet::new();
 
         // TODO(stjepang): `Local`s are stored in a linked list because linked lists are fairly
         // easy to implement in a lock-free manner. However, traversal can be slow due to cache
@@ -220,6 +253,8 @@ impl Global {
                     if local_epoch.is_pinned() && local_epoch.unpinned() != global_epoch {
                         return global_epoch;
                     }
+
+                    hazards.extend(local.shields.iter());
                 }
             }
         }
@@ -233,6 +268,7 @@ impl Global {
         // called from a thread that was pinned in `global_epoch`, and the global epoch cannot be
         // advanced two steps ahead of it.
         let new_epoch = global_epoch.successor();
+        self.hazards[(new_epoch.data >> 1) % 4].set(hazards, guard);
         self.epoch.store(new_epoch, Ordering::Release);
         new_epoch
     }
@@ -245,6 +281,9 @@ pub struct Local {
 
     /// The local epoch.
     epoch: AtomicEpoch,
+
+    /// The list of shields (hazard pointers).
+    pub(crate) shields: Shields,
 
     /// A reference to the global data.
     ///
@@ -280,6 +319,7 @@ impl Local {
                 entry: Entry::default(),
                 epoch: AtomicEpoch::new(Epoch::starting()),
                 collector: UnsafeCell::new(ManuallyDrop::new(collector.clone())),
+                shields: Shields::new(),
                 bag: UnsafeCell::new(Bag::new()),
                 guard_count: Cell::new(0),
                 handle_count: Cell::new(1),
@@ -425,6 +465,14 @@ impl Local {
                 // worse, other threads will see the new epoch late and delay GC slightly.
             }
         }
+    }
+
+    /// Acquires a shield.
+    #[inline]
+    pub fn acquire_shield<'g, T>(&'g self, shared: Shared<'g, T>) -> Option<Shield<T>> {
+        self.shields.acquire().map(|index| {
+            Shield::new(shared.into_usize(), self, index)
+        })
     }
 
     /// Increments the handle count.
