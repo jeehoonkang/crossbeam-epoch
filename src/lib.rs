@@ -81,6 +81,7 @@ extern crate lazy_static;
 extern crate memoffset;
 #[macro_use]
 extern crate scopeguard;
+extern crate membarrier;
 
 mod atomic;
 mod collector;

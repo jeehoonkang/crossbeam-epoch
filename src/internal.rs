@@ -45,6 +45,7 @@ use alloc::boxed::Box;
 
 use crossbeam_utils::CachePadded;
 use arrayvec::ArrayVec;
+use membarrier::Membarrier;
 
 use atomic::Owned;
 use collector::{LocalHandle, Collector};
@@ -135,6 +136,8 @@ pub struct Global {
     /// The global queue of bags of deferred functions.
     queue: Queue<SealedBag>,
 
+    membarrier: Membarrier,
+
     /// The global epoch.
     pub(crate) epoch: CachePadded<AtomicEpoch>,
 }
@@ -149,6 +152,7 @@ impl Global {
         Self {
             locals: List::new(),
             queue: Queue::new(),
+            membarrier: Membarrier::new(),
             epoch: CachePadded::new(AtomicEpoch::new(Epoch::starting())),
         }
     }
@@ -157,7 +161,7 @@ impl Global {
     pub fn push_bag(&self, bag: &mut Bag, guard: &Guard) {
         let bag = mem::replace(bag, Bag::new());
 
-        atomic::fence(Ordering::SeqCst);
+        self.membarrier.slow_path();
 
         let epoch = self.epoch.load(Ordering::Relaxed);
         self.queue.push(bag.seal(epoch), guard);
@@ -203,7 +207,7 @@ impl Global {
     #[cold]
     pub fn try_advance(&self, guard: &Guard) -> Epoch {
         let global_epoch = self.epoch.load(Ordering::Relaxed);
-        atomic::fence(Ordering::SeqCst);
+        self.membarrier.fast_path();
 
         // TODO(stjepang): `Local`s are stored in a linked list because linked lists are fairly
         // easy to implement in a lock-free manner. However, traversal can be slow due to cache
@@ -255,6 +259,9 @@ pub struct Local {
     /// When all guards and handles get dropped, this reference is destroyed.
     collector: UnsafeCell<ManuallyDrop<Collector>>,
 
+    /// membarrier.
+    membarrier: Membarrier,
+
     /// The local bag of deferred functions.
     pub(crate) bag: UnsafeCell<Bag>,
 
@@ -284,6 +291,7 @@ impl Local {
                 entry: Entry::default(),
                 epoch: AtomicEpoch::new(Epoch::starting()),
                 collector: UnsafeCell::new(ManuallyDrop::new(collector.clone())),
+                membarrier: collector.global.membarrier,
                 bag: UnsafeCell::new(Bag::new()),
                 guard_count: Cell::new(0),
                 handle_count: Cell::new(1),
@@ -351,7 +359,8 @@ impl Local {
             // Now we must store `new_epoch` into `self.epoch` and execute a `SeqCst` fence.
             // The fence makes sure that any future loads from `Atomic`s will not happen before
             // this store.
-            if cfg!(any(target_arch = "x86", target_arch = "x86_64")) {
+            if cfg!(all(any(target_arch = "x86", target_arch = "x86_64"),
+                        not(features = "linux_membarrier"))) {
                 // HACK(stjepang): On x86 architectures there are two different ways of executing
                 // a `SeqCst` fence.
                 //
@@ -366,7 +375,7 @@ impl Local {
                 debug_assert_eq!(current, previous, "participant was expected to be unpinned");
             } else {
                 self.epoch.store(new_epoch, Ordering::Relaxed);
-                atomic::fence(Ordering::SeqCst);
+                self.membarrier.fast_path();
             }
 
             // Increment the pin counter.
