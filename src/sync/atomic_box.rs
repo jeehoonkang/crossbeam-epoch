@@ -44,7 +44,7 @@ impl<T: Send + 'static> AtomicBox<T> {
     fn set_internal<'g>(&'g self, new: Shared<'g, T>, guard: &'g Guard) {
         let previous = self.swap_internal(new, guard);
         if !previous.is_null() {
-            unsafe { guard.defer(move || previous.into_owned()); }
+            unsafe { guard.defer_destroy(previous); }
         }
     }
 
@@ -84,7 +84,7 @@ impl<T: Send + Sync + Clone + 'static> AtomicBox<T> {
         let previous = self.swap_internal(shared, guard);
         unsafe { previous.as_ref() }.map(|previous_ref| {
             let result = previous_ref.clone();
-            unsafe { guard.defer(move || previous.into_owned()); }
+            unsafe { guard.defer_destroy(previous); }
             result
         })
     }
