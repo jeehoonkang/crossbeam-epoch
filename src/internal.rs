@@ -53,7 +53,7 @@ use collector::{LocalHandle, Collector};
 use epoch::{AtomicEpoch, Epoch};
 use guard::{unprotected, Guard};
 use deferred::Deferred;
-use hazard::{HazardSet, Shield};
+use hazard::{WorkingSet, Shield};
 use sync::list::{List, Entry, IterError, IsElement};
 use sync::queue::Queue;
 
@@ -158,7 +158,7 @@ impl Global {
         Self {
             locals: List::new(),
             queue: Queue::new(),
-            hazards: Atomic::new(vec![]),
+            hazards: Atomic::new(Vec::new()),
             epoch: CachePadded::new(AtomicEpoch::new(Epoch::starting())),
         }
     }
@@ -236,7 +236,7 @@ impl Global {
                         return global_epoch;
                     }
 
-                    hazards.extend(local.hazards.iter());
+                    hazards.extend(local.working_set.iter());
                 }
             }
         }
@@ -274,8 +274,8 @@ pub struct Local {
     /// When all guards and handles get dropped, this reference is destroyed.
     collector: UnsafeCell<ManuallyDrop<Collector>>,
 
-    /// The set of hazard pointers.
-    pub(crate) hazards: HazardSet,
+    /// The working set.
+    pub(crate) working_set: WorkingSet,
 
     /// The local bag of deferred functions.
     pub(crate) bag: UnsafeCell<Bag>,
@@ -306,7 +306,7 @@ impl Local {
                 entry: Entry::default(),
                 epoch: AtomicEpoch::new(Epoch::starting()),
                 collector: UnsafeCell::new(ManuallyDrop::new(collector.clone())),
-                hazards: HazardSet::new(),
+                working_set: WorkingSet::new(),
                 bag: UnsafeCell::new(Bag::new()),
                 guard_count: Cell::new(0),
                 handle_count: Cell::new(1),
@@ -459,7 +459,7 @@ impl Local {
     pub fn acquire_shield<'g, T>(&'g self, shared: Shared<'g, T>) -> Option<Shield<T>> {
         self.acquire_handle();
         let data = shared.into_usize();
-        let index = self.hazards.acquire(data)?;
+        let index = self.working_set.acquire(data)?;
         Some(Shield {
             data: Cell::new(data),
             local: Cell::new(self),
@@ -468,16 +468,10 @@ impl Local {
         })
     }
 
-    /// Updates a shield.
-    #[inline]
-    pub fn update_shield<'g, T>(&'g self, index: usize, data: usize) {
-        self.hazards.update(index, data);
-    }
-
     /// Releases a shield.
     #[inline]
     pub fn release_shield<'g, T>(&'g self, index: usize) {
-        self.hazards.release(index);
+        self.working_set.release(index);
         self.release_handle();
     }
 

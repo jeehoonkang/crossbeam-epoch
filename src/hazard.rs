@@ -7,66 +7,86 @@ use internal::Local;
 use atomic::{Shared, Pointer};
 
 /// TODO
-#[derive(Debug)]
-pub struct HazardSet {
+pub struct WorkingSet {
     /// Which pointers are hazardous?
-    inuse: AtomicUsize,
+    hazard_bits: [AtomicUsize; WorkingSet::SIZE / (8 * mem::size_of::<usize>())],
 
-    /// The array of hazard pointers.
-    pointers: [AtomicUsize; HazardSet::NUM_SHIELDS],
+    /// Reference counters.
+    ref_counts: [Cell<usize>; WorkingSet::SIZE],
+
+    /// The array of pointers in use.
+    pointers: [AtomicUsize; WorkingSet::SIZE],
 }
 
-impl HazardSet {
-    /// Number of shields for each `Local`.
-    const NUM_SHIELDS: usize = 16;
+impl WorkingSet {
+    /// The size of working set.
+    const SIZE: usize = 64;
 
     pub fn new() -> Self {
-        /// FIXME(@jeehoonkang): Currently `NUM_SHIELDS` should be <= `8 * size_of(usize)` because
-        /// `inuse: AtomicUsize` is used as the valid bit.  We can relax it later.
-        const_assert!(Self::NUM_SHIELDS <= 8 * mem::size_of::<usize>());
+        const_assert!(WorkingSet::SIZE % (8 * mem::size_of::<usize>()) == 0);
 
-        Self {
-            inuse: AtomicUsize::new(0),
-            pointers: Default::default(),
-        }
+        unsafe { mem::zeroed() }
     }
 
-    /// Acquires a shield.
+    #[inline]
+    fn set_hazard_bit(&self, index: usize) {
+        let index1 = index / (8 * mem::size_of::<usize>());
+        let index2 = index % (8 * mem::size_of::<usize>());
+        let bits = self.hazard_bits[index1].load(Ordering::Relaxed);
+        self.hazard_bits[index1].store(bits | (1 << index2), Ordering::Relaxed);
+    }
+
+    #[inline]
+    fn unset_hazard_bit(&self, index: usize) {
+        let index1 = index / (8 * mem::size_of::<usize>());
+        let index2 = index % (8 * mem::size_of::<usize>());
+        let bits = self.hazard_bits[index1].load(Ordering::Relaxed);
+        self.hazard_bits[index1].store(bits & !(1 << index2), Ordering::Release);
+    }
+
+    /// Acquires a pointer entry.
     #[inline]
     pub fn acquire(&self, data: usize) -> Option<usize> {
-        let inuse = self.inuse.load(Ordering::Relaxed);
-        let index = (!inuse).trailing_zeros() as usize;
-
-        if index >= Self::NUM_SHIELDS {
-            return None;
+        for index in 0..Self::SIZE {
+            let ref_count = &self.ref_counts[index];
+            if ref_count.get() == 0 {
+                ref_count.set(1);
+                self.pointers[index].store(data, Ordering::Relaxed);
+                return Some(index);
+            }
         }
 
-        self.inuse.store(inuse | (1 << index), Ordering::Relaxed);
-        self.pointers[index].store(data, Ordering::Relaxed);
-        Some(index)
+        None
     }
 
-    /// Updates a shield.
+    /// Increments a reference to a pointer entry.
     #[inline]
-    pub fn update(&self, index: usize, data: usize) {
-        self.pointers[index].store(data, Ordering::Release);
+    pub fn increment(&self, index: usize) {
+        let ref_count = &self.ref_counts[index];
+        ref_count.set(ref_count.get() + 1);
     }
 
-    /// Releases a shield.
+    /// Releases a reference to a pointer entry.
     #[inline]
     pub fn release(&self, index: usize) {
-        fence(Ordering::Release);
-        let inuse = self.inuse.load(Ordering::Relaxed);
-        self.inuse.store(inuse & !(1 << index), Ordering::Relaxed);
-        self.pointers[index].store(0, Ordering::Relaxed);
+        let ref_count = &self.ref_counts[index];
+        let value = ref_count.get();
+        ref_count.set(value - 1);
+
+        if value == 1 {
+            fence(Ordering::Release);
+            self.pointers[index].store(0, Ordering::Relaxed);
+            self.unset_hazard_bit(index);
+        }
     }
+
 
     /// Returns an iterator for hazard pointers.
     pub fn iter(&self) -> HazardIter {
-        let inuse = self.inuse.load(Ordering::Relaxed);
         HazardIter {
-            indexes: inuse,
-            pointers: &self.pointers as *const _,
+            index1: 0,
+            indexes2: 0,
+            working_set: self as *const _,
         }
     }
 }
@@ -74,22 +94,41 @@ impl HazardSet {
 /// TODO
 #[derive(Debug)]
 pub struct HazardIter {
-    indexes: usize,
-    pointers: *const [AtomicUsize; HazardSet::NUM_SHIELDS],
+    index1: usize,
+    indexes2: usize,
+    working_set: *const WorkingSet,
 }
 
 impl Iterator for HazardIter {
     type Item = usize;
 
     fn next(&mut self) -> Option<Self::Item> {
-        loop {
-            let index = self.indexes.trailing_zeros() as usize;
+        while self.indexes2 == 0 {
+            self.indexes2 = unsafe { (*self.working_set).hazard_bits[self.index1].load(Ordering::Relaxed) };
+            self.index1 += 1;
 
-            if index >= mem::size_of::<usize>() {
+            if self.index1 >= WorkingSet::SIZE / (8 * mem::size_of::<usize>()) {
                 return None;
+            }
+        }
+
+        loop {
+            let index2 = self.indexes2.trailing_zeros() as usize;
+
+            if index2 >= 8 * mem::size_of::<usize>() {
+                self.indexes2 = unsafe { (*self.working_set).hazard_bits[self.index1].load(Ordering::Relaxed) };
+                self.index1 += 1;
+
+                if self.index1 >= WorkingSet::SIZE / (8 * mem::size_of::<usize>()) {
+                    return None;
+                }
             } else {
-                self.indexes &= !(1 << index);
-                let pointer = unsafe { (*self.pointers)[index].load(Ordering::Relaxed) };
+                self.indexes2 &= !(1 << index2);
+                let pointer = unsafe {
+                    ((*self.working_set).pointers)
+                        [self.index1 * (8 * mem::size_of::<usize>()) + index2]
+                        .load(Ordering::Relaxed)
+                };
                 if pointer != 0 {
                     return Some(pointer);
                 }
@@ -122,7 +161,7 @@ impl<T> Shield<T> {
     /// TODO
     pub fn defend<'g>(&self, shared: Shared<'g, T>) {
         let data = shared.into_usize();
-        self.local().update_shield::<T>(self.index.get(), data);
+        // TODO: self.local().update_shield::<T>(self.index.get(), data);
         self.data.set(data);
     }    
 
