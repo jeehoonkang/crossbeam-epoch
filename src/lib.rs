@@ -81,6 +81,8 @@ extern crate lazy_static;
 extern crate memoffset;
 #[macro_use]
 extern crate scopeguard;
+#[macro_use]
+extern crate static_assertions;
 
 mod atomic;
 mod collector;
@@ -91,9 +93,11 @@ mod epoch;
 mod guard;
 mod internal;
 mod sync;
+mod hazard;
 
 pub use self::atomic::{Atomic, CompareAndSetError, CompareAndSetOrdering, Owned, Shared, Pointer};
 pub use self::guard::{unprotected, Guard};
 #[cfg(feature = "use_std")]
 pub use self::default::{default_collector, is_pinned, pin};
 pub use self::collector::{Collector, LocalHandle};
+pub use self::hazard::Shield;

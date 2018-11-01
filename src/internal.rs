@@ -38,19 +38,22 @@
 use core::cell::{Cell, UnsafeCell};
 use core::mem::{self, ManuallyDrop};
 use core::num::Wrapping;
+use core::marker::PhantomData;
 use core::ptr;
 use core::sync::atomic;
 use core::sync::atomic::Ordering;
 use alloc::boxed::Box;
+use alloc::vec::Vec;
 
 use crossbeam_utils::CachePadded;
 use arrayvec::ArrayVec;
 
-use atomic::Owned;
+use atomic::{Atomic, Owned, Shared, Pointer};
 use collector::{LocalHandle, Collector};
 use epoch::{AtomicEpoch, Epoch};
 use guard::{unprotected, Guard};
 use deferred::Deferred;
+use hazard::{HazardSet, Shield};
 use sync::list::{List, Entry, IterError, IsElement};
 use sync::queue::Queue;
 
@@ -135,6 +138,12 @@ pub struct Global {
     /// The global queue of bags of deferred functions.
     queue: Queue<SealedBag>,
 
+    /// The set of hazard pointers.
+    ///
+    /// FIXME(@jeehoonkang): probably approximate membership sets---such as bloom filters or cuckoo
+    /// filters---better serves our purposes, but I couldn't find no_std ones out there.
+    hazards: Atomic<Vec<usize>>,
+
     /// The global epoch.
     pub(crate) epoch: CachePadded<AtomicEpoch>,
 }
@@ -149,6 +158,7 @@ impl Global {
         Self {
             locals: List::new(),
             queue: Queue::new(),
+            hazards: Atomic::new(vec![]),
             epoch: CachePadded::new(AtomicEpoch::new(Epoch::starting())),
         }
     }
@@ -183,7 +193,10 @@ impl Global {
             )
             {
                 None => break,
-                Some(sealed_bag) => drop(sealed_bag),
+                Some(sealed_bag) => {
+                    // TODO: Don't destroy hazards.
+                    drop(sealed_bag);
+                }
             }
         }
     }
@@ -201,10 +214,12 @@ impl Global {
         let global_epoch = self.epoch.load(Ordering::Relaxed);
         atomic::fence(Ordering::SeqCst);
 
+        let mut hazards = Vec::new();
+
         // TODO(stjepang): `Local`s are stored in a linked list because linked lists are fairly
         // easy to implement in a lock-free manner. However, traversal can be slow due to cache
         // misses and data dependencies. We should experiment with other data structures as well.
-        for local in self.locals.iter(&guard) {
+        for local in self.locals.iter(guard) {
             match local {
                 Err(IterError::Stalled) => {
                     // A concurrent thread stalled this iteration. That thread might also try to
@@ -220,10 +235,18 @@ impl Global {
                     if local_epoch.is_pinned() && local_epoch.unpinned() != global_epoch {
                         return global_epoch;
                     }
+
+                    hazards.extend(local.hazards.iter());
                 }
             }
         }
         atomic::fence(Ordering::Acquire);
+
+        // Updates hazards.
+        hazards.sort();
+        let hazards = Owned::new(hazards);
+        let old_hazards = self.hazards.swap(hazards, Ordering::Relaxed, guard);
+        unsafe { guard.defer_destroy(old_hazards); }
 
         // All pinned participants were pinned in the current global epoch.
         // Now let's advance the global epoch...
@@ -250,6 +273,9 @@ pub struct Local {
     ///
     /// When all guards and handles get dropped, this reference is destroyed.
     collector: UnsafeCell<ManuallyDrop<Collector>>,
+
+    /// The set of hazard pointers.
+    pub(crate) hazards: HazardSet,
 
     /// The local bag of deferred functions.
     pub(crate) bag: UnsafeCell<Bag>,
@@ -280,6 +306,7 @@ impl Local {
                 entry: Entry::default(),
                 epoch: AtomicEpoch::new(Epoch::starting()),
                 collector: UnsafeCell::new(ManuallyDrop::new(collector.clone())),
+                hazards: HazardSet::new(),
                 bag: UnsafeCell::new(Bag::new()),
                 guard_count: Cell::new(0),
                 handle_count: Cell::new(1),
@@ -425,6 +452,33 @@ impl Local {
                 // worse, other threads will see the new epoch late and delay GC slightly.
             }
         }
+    }
+
+    /// Acquires a shield.
+    #[inline]
+    pub fn acquire_shield<'g, T>(&'g self, shared: Shared<'g, T>) -> Option<Shield<T>> {
+        self.acquire_handle();
+        let data = shared.into_usize();
+        let index = self.hazards.acquire(data)?;
+        Some(Shield {
+            data: Cell::new(data),
+            local: Cell::new(self),
+            index: Cell::new(index),
+            _marker: PhantomData,
+        })
+    }
+
+    /// Updates a shield.
+    #[inline]
+    pub fn update_shield<'g, T>(&'g self, index: usize, data: usize) {
+        self.hazards.update(index, data);
+    }
+
+    /// Releases a shield.
+    #[inline]
+    pub fn release_shield<'g, T>(&'g self, index: usize) {
+        self.hazards.release(index);
+        self.release_handle();
     }
 
     /// Increments the handle count.
