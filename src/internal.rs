@@ -48,12 +48,12 @@ use alloc::vec::Vec;
 use crossbeam_utils::CachePadded;
 use arrayvec::ArrayVec;
 
-use atomic::{Atomic, Owned, Shared, Pointer};
+use atomic::{Atomic, Owned, Shared, Shield, Pointer};
 use collector::{LocalHandle, Collector};
 use epoch::{AtomicEpoch, Epoch};
 use guard::{unprotected, Guard};
 use deferred::Deferred;
-use hazard::{WorkingSet, Shield};
+use root_set::{RootSet, Root};
 use sync::list::{List, Entry, IterError, IsElement};
 use sync::queue::Queue;
 
@@ -236,7 +236,7 @@ impl Global {
                         return global_epoch;
                     }
 
-                    hazards.extend(local.working_set.iter());
+                    hazards.extend(local.root_set.iter());
                 }
             }
         }
@@ -275,7 +275,7 @@ pub struct Local {
     collector: UnsafeCell<ManuallyDrop<Collector>>,
 
     /// The working set.
-    pub(crate) working_set: WorkingSet,
+    pub(crate) root_set: RootSet,
 
     /// The local bag of deferred functions.
     pub(crate) bag: UnsafeCell<Bag>,
@@ -306,7 +306,7 @@ impl Local {
                 entry: Entry::default(),
                 epoch: AtomicEpoch::new(Epoch::starting()),
                 collector: UnsafeCell::new(ManuallyDrop::new(collector.clone())),
-                working_set: WorkingSet::new(),
+                root_set: RootSet::new(),
                 bag: UnsafeCell::new(Bag::new()),
                 guard_count: Cell::new(0),
                 handle_count: Cell::new(1),
@@ -454,12 +454,24 @@ impl Local {
         }
     }
 
+    /// Acquires a managed pointer.
+    #[inline]
+    pub fn acquire_managed<T>(&self, data: usize) -> Root<T> {
+        let index = self.root_set.acquire_slot::<T>(data);
+        Self {
+            data: data,
+            local: self,
+            index,
+            _marker: PhantomData,
+        }
+    }
+
     /// Acquires a shield.
     #[inline]
     pub fn acquire_shield<'g, T>(&'g self, shared: Shared<'g, T>) -> Option<Shield<T>> {
         self.acquire_handle();
         let data = shared.into_usize();
-        let index = self.working_set.acquire(data)?;
+        let index = self.root_set.acquire_slot::<T>(data)?;
         Some(Shield {
             data: Cell::new(data),
             local: Cell::new(self),
@@ -471,7 +483,7 @@ impl Local {
     /// Releases a shield.
     #[inline]
     pub fn release_shield<'g, T>(&'g self, index: usize) {
-        self.working_set.release(index);
+        self.root_set.release_slot(index);
         self.release_handle();
     }
 

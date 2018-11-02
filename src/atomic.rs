@@ -9,8 +9,11 @@ use core::sync::atomic::{AtomicUsize, ATOMIC_USIZE_INIT};
 use core::sync::atomic::Ordering;
 use alloc::boxed::Box;
 
-use guard::Guard;
 use crossbeam_utils::AtomicConsume;
+
+use guard::Guard;
+use root_set::Root;
+use tag::*;
 
 /// Given ordering for the success case in a compare-exchange operation, returns the strongest
 /// appropriate ordering for the failure case.
@@ -86,34 +89,6 @@ impl CompareAndSetOrdering for (Ordering, Ordering) {
     fn failure(&self) -> Ordering {
         self.1
     }
-}
-
-/// Panics if the pointer is not properly unaligned.
-#[inline]
-fn ensure_aligned<T>(raw: *const T) {
-    assert_eq!(raw as usize & low_bits::<T>(), 0, "unaligned pointer");
-}
-
-/// Returns a bitmask containing the unused least significant bits of an aligned pointer to `T`.
-#[inline]
-fn low_bits<T>() -> usize {
-    (1 << mem::align_of::<T>().trailing_zeros()) - 1
-}
-
-/// Given a tagged pointer `data`, returns the same pointer, but tagged with `tag`.
-///
-/// `tag` is truncated to fit into the unused bits of the pointer to `T`.
-#[inline]
-fn data_with_tag<T>(data: usize, tag: usize) -> usize {
-    (data & !low_bits::<T>()) | (tag & low_bits::<T>())
-}
-
-/// Decomposes a tagged pointer `data` into the pointer and the tag.
-#[inline]
-fn decompose_data<T>(data: usize) -> (*mut T, usize) {
-    let raw = (data & !low_bits::<T>()) as *mut T;
-    let tag = data & low_bits::<T>();
-    (raw, tag)
 }
 
 /// An atomic pointer that can be safely shared between threads.
@@ -206,8 +181,8 @@ impl<T> Atomic<T> {
     /// let guard = &epoch::pin();
     /// let p = a.load(SeqCst, guard);
     /// ```
-    pub fn load<'g>(&self, ord: Ordering, _: &'g Guard) -> Shared<'g, T> {
-        unsafe { Shared::from_usize(self.data.load(ord)) }
+    pub fn load<'g>(&self, ord: Ordering, guard: &'g Guard) -> Shared<'g, T> {
+        unsafe { Shared::from_usize2(self.data.load(ord), guard) }
     }
 
     /// Loads a `Shared` from the atomic pointer using a "consume" memory ordering.
@@ -231,8 +206,8 @@ impl<T> Atomic<T> {
     /// let guard = &epoch::pin();
     /// let p = a.load_consume(guard);
     /// ```
-    pub fn load_consume<'g>(&self, _: &'g Guard) -> Shared<'g, T> {
-        unsafe { Shared::from_usize(self.data.load_consume()) }
+    pub fn load_consume<'g>(&self, guard: &'g Guard) -> Shared<'g, T> {
+        unsafe { Shared::from_usize2(self.data.load_consume(), guard) }
     }
 
     /// Stores a `Shared` or `Owned` pointer into the atomic pointer.
@@ -274,8 +249,8 @@ impl<T> Atomic<T> {
     /// let guard = &epoch::pin();
     /// let p = a.swap(Shared::null(), SeqCst, guard);
     /// ```
-    pub fn swap<'g, P: Pointer<T>>(&self, new: P, ord: Ordering, _: &'g Guard) -> Shared<'g, T> {
-        unsafe { Shared::from_usize(self.data.swap(new.into_usize(), ord)) }
+    pub fn swap<'g, P: Pointer<T>>(&self, new: P, ord: Ordering, guard: &'g Guard) -> Shared<'g, T> {
+        unsafe { Shared::from_usize2(self.data.swap(new.into_usize(), ord), guard) }
     }
 
     /// Stores the pointer `new` (either `Shared` or `Owned`) into the atomic pointer if the current
@@ -304,9 +279,9 @@ impl<T> Atomic<T> {
     /// let res1 = a.compare_and_set(curr, Shared::null(), SeqCst, guard);
     /// let res2 = a.compare_and_set(curr, Owned::new(5678), SeqCst, guard);
     /// ```
-    pub fn compare_and_set<'g, O, P>(
+    pub fn compare_and_set<'s, 'g, O, P>(
         &self,
-        current: Shared<T>,
+        current: &'s Shared<T>,
         new: P,
         ord: O,
         _: &'g Guard,
@@ -418,8 +393,8 @@ impl<T> Atomic<T> {
     /// assert_eq!(a.fetch_and(2, SeqCst, guard).tag(), 3);
     /// assert_eq!(a.load(SeqCst, guard).tag(), 2);
     /// ```
-    pub fn fetch_and<'g>(&self, val: usize, ord: Ordering, _: &'g Guard) -> Shared<'g, T> {
-        unsafe { Shared::from_usize(self.data.fetch_and(val | !low_bits::<T>(), ord)) }
+    pub fn fetch_and<'g>(&self, val: usize, ord: Ordering, guard: &'g Guard) -> Shared<'g, T> {
+        unsafe { Shared::from_usize2(self.data.fetch_and(val | !low_bits::<T>(), ord), guard) }
     }
 
     /// Bitwise "or" with the current tag.
@@ -443,8 +418,8 @@ impl<T> Atomic<T> {
     /// assert_eq!(a.fetch_or(2, SeqCst, guard).tag(), 1);
     /// assert_eq!(a.load(SeqCst, guard).tag(), 3);
     /// ```
-    pub fn fetch_or<'g>(&self, val: usize, ord: Ordering, _: &'g Guard) -> Shared<'g, T> {
-        unsafe { Shared::from_usize(self.data.fetch_or(val & low_bits::<T>(), ord)) }
+    pub fn fetch_or<'g>(&self, val: usize, ord: Ordering, guard: &'g Guard) -> Shared<'g, T> {
+        unsafe { Shared::from_usize2(self.data.fetch_or(val & low_bits::<T>(), ord), guard) }
     }
 
     /// Bitwise "xor" with the current tag.
@@ -468,8 +443,8 @@ impl<T> Atomic<T> {
     /// assert_eq!(a.fetch_xor(3, SeqCst, guard).tag(), 1);
     /// assert_eq!(a.load(SeqCst, guard).tag(), 2);
     /// ```
-    pub fn fetch_xor<'g>(&self, val: usize, ord: Ordering, _: &'g Guard) -> Shared<'g, T> {
-        unsafe { Shared::from_usize(self.data.fetch_xor(val & low_bits::<T>(), ord)) }
+    pub fn fetch_xor<'g>(&self, val: usize, ord: Ordering, guard: &'g Guard) -> Shared<'g, T> {
+        unsafe { Shared::from_usize2(self.data.fetch_xor(val & low_bits::<T>(), ord), guard) }
     }
 }
 
@@ -539,7 +514,7 @@ impl<T> From<T> for Atomic<T> {
     }
 }
 
-impl<'g, T> From<Shared<'g, T>> for Atomic<T> {
+impl<'s, 'g, T> From<&'s Shared<'g, T>> for Atomic<T> {
     /// Returns a new atomic pointer pointing to `ptr`.
     ///
     /// # Examples
@@ -549,8 +524,8 @@ impl<'g, T> From<Shared<'g, T>> for Atomic<T> {
     ///
     /// let a = Atomic::<i32>::from(Shared::<i32>::null());
     /// ```
-    fn from(ptr: Shared<'g, T>) -> Self {
-        Self::from_usize(ptr.data)
+    fn from(ptr: &'s Shared<'g, T>) -> Self {
+        Self::from_usize(ptr.inner.data)
     }
 }
 
@@ -662,8 +637,8 @@ impl<T> Owned<T> {
     /// ```
     ///
     /// [`Shared`]: struct.Shared.html
-    pub fn into_shared<'g>(self, _: &'g Guard) -> Shared<'g, T> {
-        unsafe { Shared::from_usize(self.into_usize()) }
+    pub fn into_shared<'g>(self, guard: &'g Guard) -> Shared<'g, T> {
+        Shared::from_usize2(self.into_usize(), guard)
     }
 
     /// Converts the owned pointer into a `Box`.
@@ -814,25 +789,14 @@ impl<T> AsMut<T> for Owned<T> {
 /// The pointer must be properly aligned. Since it is aligned, a tag can be stored into the unused
 /// least significant bits of the address.
 pub struct Shared<'g, T: 'g> {
-    data: usize,
-    _marker: PhantomData<(&'g (), *const T)>,
+    pub(crate) inner: Root<T>,
+    _marker: PhantomData<&'g ()>,
 }
 
-impl<'g, T> Clone for Shared<'g, T> {
-    fn clone(&self) -> Self {
-        Shared {
-            data: self.data,
-            _marker: PhantomData,
-        }
-    }
-}
-
-impl<'g, T> Copy for Shared<'g, T> {}
-
-impl<'g, T> Pointer<T> for Shared<'g, T> {
+impl<'s, 'g, T> Pointer<T> for &'s Shared<'g, T> {
     #[inline]
     fn into_usize(self) -> usize {
-        self.data
+        self.inner.data
     }
 
     #[inline]
@@ -845,6 +809,22 @@ impl<'g, T> Pointer<T> for Shared<'g, T> {
 }
 
 impl<'g, T> Shared<'g, T> {
+    // TODO: rename
+    #[inline]
+    unsafe fn from_usize2(data: usize, guard: &'g Guard) -> Self {
+        if let Some(local) = unsafe { guard.local.as_ref() } {
+            Self {
+                inner: local.acquire_managed(data),
+                _marker: PhantomData,
+            }
+        } else {
+            Self {
+                inner: Root::unprotected(data),
+                _marker: PhantomData,
+            }
+        }
+    }
+
     /// Returns a new null pointer.
     ///
     /// # Examples
@@ -855,11 +835,27 @@ impl<'g, T> Shared<'g, T> {
     /// let p = Shared::<i32>::null();
     /// assert!(p.is_null());
     /// ```
-    pub fn null() -> Shared<'g, T> {
-        Shared {
-            data: 0,
-            _marker: PhantomData,
-        }
+    pub fn null(guard: &'g Guard) -> Self {
+        Self::from_usize2(0, guard)
+    }
+
+    /// Returns a new pointer pointing to `raw`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `raw` is not properly aligned.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use crossbeam_epoch::Shared;
+    ///
+    /// let p = unsafe { Shared::from(Box::into_raw(Box::new(1234)) as *const _) };
+    /// assert!(!p.is_null());
+    /// ```
+    fn from_raw(raw: *const T, guard: &'g Guard) -> Self {
+        ensure_aligned(raw);
+        unsafe { Self::from_usize2(raw as usize, guard) }
     }
 
     /// Returns `true` if the pointer is null.
@@ -897,8 +893,7 @@ impl<'g, T> Shared<'g, T> {
     /// assert_eq!(p.as_raw(), raw);
     /// ```
     pub fn as_raw(&self) -> *const T {
-        let (raw, _) = decompose_data::<T>(self.data);
-        raw
+        self.inner.as_raw()
     }
 
     /// Dereferences the pointer.
@@ -1000,7 +995,7 @@ impl<'g, T> Shared<'g, T> {
             self.as_raw() != ptr::null(),
             "converting a null `Shared` into `Owned`"
         );
-        Owned::from_usize(self.data)
+        Owned::from_usize(self.inner.into_raw())
     }
 
     /// Returns the tag stored within the pointer.
@@ -1017,8 +1012,7 @@ impl<'g, T> Shared<'g, T> {
     /// assert_eq!(p.tag(), 2);
     /// ```
     pub fn tag(&self) -> usize {
-        let (_, tag) = decompose_data::<T>(self.data);
-        tag
+        self.inner.tag()
     }
 
     /// Returns the same pointer, but tagged with `tag`. `tag` is truncated to be fit into the
@@ -1039,35 +1033,17 @@ impl<'g, T> Shared<'g, T> {
     /// assert_eq!(p2.tag(), 2);
     /// assert_eq!(p1.as_raw(), p2.as_raw());
     /// ```
-    pub fn with_tag(&self, tag: usize) -> Shared<'g, T> {
-        unsafe { Self::from_usize(data_with_tag::<T>(self.data, tag)) }
-    }
-}
-
-impl<'g, T> From<*const T> for Shared<'g, T> {
-    /// Returns a new pointer pointing to `raw`.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `raw` is not properly aligned.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use crossbeam_epoch::Shared;
-    ///
-    /// let p = unsafe { Shared::from(Box::into_raw(Box::new(1234)) as *const _) };
-    /// assert!(!p.is_null());
-    /// ```
-    fn from(raw: *const T) -> Self {
-        ensure_aligned(raw);
-        unsafe { Self::from_usize(raw as usize) }
+    pub fn with_tag(mut self, tag: usize) -> Shared<'g, T> {
+        Self {
+            inner: self.inner.with_tag(tag),
+            _marker: PhantomData,
+        }
     }
 }
 
 impl<'g, T> PartialEq<Shared<'g, T>> for Shared<'g, T> {
     fn eq(&self, other: &Self) -> bool {
-        self.data == other.data
+        self.inner == other.inner
     }
 }
 
@@ -1075,19 +1051,21 @@ impl<'g, T> Eq for Shared<'g, T> {}
 
 impl<'g, T> PartialOrd<Shared<'g, T>> for Shared<'g, T> {
     fn partial_cmp(&self, other: &Self) -> Option<cmp::Ordering> {
-        self.data.partial_cmp(&other.data)
+        self.inner.partial_cmp(&other.inner)
     }
 }
 
 impl<'g, T> Ord for Shared<'g, T> {
     fn cmp(&self, other: &Self) -> cmp::Ordering {
-        self.data.cmp(&other.data)
+        self.inner.cmp(&other.inner)
     }
 }
 
 impl<'g, T> fmt::Debug for Shared<'g, T> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        let (raw, tag) = decompose_data::<T>(self.data);
+        // TODO: print slot info?
+
+        let (raw, tag) = decompose_data::<T>(self.inner.data);
 
         f.debug_struct("Shared")
             .field("raw", &raw)
@@ -1105,6 +1083,36 @@ impl<'g, T> fmt::Pointer for Shared<'g, T> {
 impl<'g, T> Default for Shared<'g, T> {
     fn default() -> Self {
         Shared::null()
+    }
+}
+
+/// Shield of hazard pointers.
+#[derive(Debug)]
+pub struct Shield<T> {
+    inner: Root<T>,
+}
+
+impl<'g, T> From<Shared<'g, T>> for Shield<T> {
+    fn from(ptr: Shared<'g, T>) -> Self {
+        ptr.inner.local().root_set.set_hazard_bit(ptr.inner.index);
+        Self {
+            inner: ptr.inner,
+        }
+    }
+}
+
+impl<T> Shield<T> {
+    /// TODO
+    pub fn defend<'g>(&self, ptr: Shared<'g, T>) {
+        let data = ptr.into_usize();
+        // TODO: self.local().update_shield::<T>(self.index.get(), data);
+        self.data.set(data);
+    }    
+
+    /// TODO
+    #[inline]
+    pub fn release(&self) {
+        self.defend(Shared::null());
     }
 }
 

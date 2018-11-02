@@ -93,11 +93,11 @@ mod epoch;
 mod guard;
 mod internal;
 mod sync;
-mod hazard;
+mod root_set;
+mod tag;
 
-pub use self::atomic::{Atomic, CompareAndSetError, CompareAndSetOrdering, Owned, Shared, Pointer};
+pub use self::atomic::{Atomic, CompareAndSetError, CompareAndSetOrdering, Owned, Shared, Shield, Pointer};
 pub use self::guard::{unprotected, Guard};
 #[cfg(feature = "use_std")]
 pub use self::default::{default_collector, is_pinned, pin};
 pub use self::collector::{Collector, LocalHandle};
-pub use self::hazard::Shield;
