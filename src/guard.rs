@@ -1,11 +1,13 @@
 use core::fmt;
 use core::ptr;
 use core::mem;
+use core::marker::PhantomData;
 
 use atomic::Shared;
 use collector::Collector;
 use deferred::Deferred;
 use internal::Local;
+use shield::{Shield, ShieldError};
 
 /// A guard that keeps the current thread pinned.
 ///
@@ -80,6 +82,20 @@ pub struct Guard {
 }
 
 impl Guard {
+    /// TODO
+    pub fn shield<'g, T>(&self) -> Result<Shield<'g, T>, ShieldError> {
+        if let Some(local) = unsafe { self.local.as_ref() } {
+            local.acquire_shield()
+        } else {
+            Ok(Shield {
+                data: 0,
+                local: ptr::null(),
+                index: 0,
+                _marker: PhantomData,
+            })
+        }
+    }
+
     /// Stores a function so that it can be executed at some point after all currently pinned
     /// threads get unpinned.
     ///

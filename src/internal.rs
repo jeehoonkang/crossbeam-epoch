@@ -36,11 +36,11 @@
 //! destroyed as soon as the data structure gets dropped.
 
 use core::cell::{Cell, UnsafeCell};
+use core::marker::PhantomData;
 use core::mem::{self, ManuallyDrop};
 use core::num::Wrapping;
 use core::ptr;
-use core::sync::atomic;
-use core::sync::atomic::Ordering;
+use core::sync::atomic::{self, Ordering};
 use alloc::boxed::Box;
 
 use crossbeam_utils::CachePadded;
@@ -51,6 +51,7 @@ use collector::{LocalHandle, Collector};
 use epoch::{AtomicEpoch, Epoch};
 use guard::{unprotected, Guard};
 use deferred::Deferred;
+use shield::{ShieldSet, Shield, ShieldError};
 use sync::list::{List, Entry, IterError, IsElement};
 use sync::queue::Queue;
 
@@ -251,6 +252,10 @@ pub struct Local {
     /// When all guards and handles get dropped, this reference is destroyed.
     collector: UnsafeCell<ManuallyDrop<Collector>>,
 
+
+    /// TODO
+    pub(crate) shield_set: ShieldSet,
+
     /// The local bag of deferred functions.
     pub(crate) bag: UnsafeCell<Bag>,
 
@@ -280,6 +285,7 @@ impl Local {
                 entry: Entry::default(),
                 epoch: AtomicEpoch::new(Epoch::starting()),
                 collector: UnsafeCell::new(ManuallyDrop::new(collector.clone())),
+                shield_set: ShieldSet::new(),
                 bag: UnsafeCell::new(Bag::new()),
                 guard_count: Cell::new(0),
                 handle_count: Cell::new(1),
@@ -288,6 +294,12 @@ impl Local {
             collector.global.locals.insert(local, &unprotected());
             LocalHandle { local: local.as_raw() }
         }
+    }
+
+    /// Returns if this thread is ejected from EBR protocol.
+    #[inline]
+    pub fn is_ejected(&self) -> bool {
+        self.epoch.load(Ordering::Relaxed).is_ejected()
     }
 
     /// Returns a reference to the `Global` in which this `Local` resides.
@@ -446,6 +458,17 @@ impl Local {
         if guard_count == 0 && handle_count == 1 {
             self.finalize();
         }
+    }
+
+    /// TODO
+    pub fn acquire_shield<'g, T>(&self) -> Result<Shield<'g, T>, ShieldError> {
+        let index = self.shield_set.acquire::<T>()?;
+        Ok(Shield {
+            data: 0,
+            local: self,
+            index,
+            _marker: PhantomData,
+        })
     }
 
     /// Removes the `Local` from the global linked list.

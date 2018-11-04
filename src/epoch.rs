@@ -34,7 +34,7 @@ impl Epoch {
         // The result is the same with `(self.data & !1).wrapping_sub(rhs.data & !1) as isize >> 1`,
         // because the possible difference of LSB in `(self.data & !1).wrapping_sub(rhs.data & !1)`
         // will be ignored in the shift operation.
-        self.data.wrapping_sub(rhs.data & !1) as isize >> 1
+        self.data.wrapping_sub(rhs.data & !3) as isize >> 1
     }
 
     /// Returns `true` if the epoch is marked as pinned.
@@ -55,12 +55,30 @@ impl Epoch {
         Epoch { data: self.data & !1 }
     }
 
+    /// Returns `true` if the epoch is marked as ejected.
+    #[inline]
+    pub fn is_ejected(self) -> bool {
+        (self.data & 2) == 2
+    }
+
+    /// Returns the same epoch, but marked as pinned.
+    #[inline]
+    pub fn ejected(self) -> Epoch {
+        Epoch { data: self.data | 2 }
+    }
+
+    /// Returns the same epoch, but marked as unpinned.
+    #[inline]
+    pub fn unejected(self) -> Epoch {
+        Epoch { data: self.data & !2 }
+    }
+
     /// Returns the successor epoch.
     ///
     /// The returned epoch will be marked as pinned only if the previous one was as well.
     #[inline]
     pub fn successor(self) -> Epoch {
-        Epoch { data: self.data.wrapping_add(2) }
+        Epoch { data: self.data.wrapping_add(4) }
     }
 }
 
