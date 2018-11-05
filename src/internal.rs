@@ -51,7 +51,7 @@ use collector::{LocalHandle, Collector};
 use epoch::{AtomicEpoch, Epoch};
 use guard::{unprotected, Guard};
 use deferred::Deferred;
-use shield::{ShieldSet, Shield, ShieldError};
+use shield::{ShieldSet, Shield};
 use sync::list::{List, Entry, IterError, IsElement};
 use sync::queue::Queue;
 
@@ -291,7 +291,7 @@ impl Local {
                 handle_count: Cell::new(1),
                 pin_count: Cell::new(Wrapping(0)),
             }).into_shared(&unprotected());
-            collector.global.locals.insert(local, &unprotected());
+            collector.global.locals.insert(local, &unprotected()).unwrap();
             LocalHandle { local: local.as_raw() }
         }
     }
@@ -423,11 +423,11 @@ impl Local {
 
         // Update the local epoch only if there's only one guard.
         if guard_count == 1 {
-            let epoch = self.epoch.load(Ordering::Relaxed);
-            let global_epoch = self.global().epoch.load(Ordering::Relaxed);
+            let local_epoch = self.epoch.load(Ordering::Relaxed);
+            let global_epoch = self.global().epoch.load(Ordering::Relaxed).pinned();
 
             // Update the local epoch only if the global epoch is greater than the local epoch.
-            if epoch != global_epoch {
+            if local_epoch != global_epoch {
                 // We store the new epoch with `Release` because we need to ensure any memory
                 // accesses from the previous epoch do not leak into the new one.
                 self.epoch.store(global_epoch, Ordering::Release);
@@ -461,14 +461,13 @@ impl Local {
     }
 
     /// TODO
-    pub fn acquire_shield<'g, T>(&self) -> Result<Shield<'g, T>, ShieldError> {
-        let index = self.shield_set.acquire::<T>()?;
-        Ok(Shield {
+    pub fn acquire_shield<'g, T>(&self) -> Shield<'g, T> {
+        Shield {
             data: 0,
             local: self,
-            index,
+            index: self.shield_set.acquire::<T>(),
             _marker: PhantomData,
-        })
+        }
     }
 
     /// Removes the `Local` from the global linked list.

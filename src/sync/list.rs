@@ -6,7 +6,7 @@
 use core::marker::PhantomData;
 use core::sync::atomic::Ordering::{Acquire, Relaxed, Release};
 
-use {Atomic, Shared, Guard, unprotected};
+use {Atomic, Shared, Guard, ShieldError, unprotected};
 
 /// An entry in a linked list.
 ///
@@ -167,11 +167,13 @@ impl<T, C: IsElement<T>> List<T, C> {
     /// - `container` is immovable, e.g. inside a `Box`
     /// - the same `Entry` is not inserted more than once
     /// - the inserted object will be removed before the list is dropped
-    pub unsafe fn insert<'g>(&'g self, container: Shared<'g, T>, guard: &'g Guard) {
+    pub unsafe fn insert<'g>(&'g self, container: Shared<'g, T>, guard: &'g Guard) -> Result<(), ShieldError> {
         // Insert right after head, i.e. at the beginning of the list.
         let to = &self.head;
+        // TODO
+        let container_shield = guard.shield(container)?;
         // Get the intrusively stored Entry of the new element to insert.
-        let entry: &Entry = C::entry_of(container.deref());
+        let entry: &Entry = C::entry_of(container_shield.deref());
         // Make a Shared ptr to that Entry.
         let entry_ptr = Shared::from(entry as *const _);
         // Read the current successor of where we want to insert.
@@ -182,7 +184,7 @@ impl<T, C: IsElement<T>> List<T, C> {
             // `to`.
             entry.next.store(next, Relaxed);
             match to.compare_and_set_weak(next, entry_ptr, Release, guard) {
-                Ok(_) => break,
+                Ok(_) => return Ok(()),
                 // We lost the race or weak CAS failed spuriously. Update the successor and try
                 // again.
                 Err(err) => next = err.current,
@@ -218,13 +220,15 @@ impl<T, C: IsElement<T>> Drop for List<T, C> {
         unsafe {
             let guard = &unprotected();
             let mut curr = self.head.load(Relaxed, guard);
-            while let Some(c) = curr.as_ref() {
+            let mut curr_shield = guard.shield(curr).unwrap();
+            while let Some(c) = curr_shield.as_ref() {
                 let succ = c.next.load(Relaxed, guard);
                 // Verify that all elements have been removed from the list.
                 assert_eq!(succ.tag(), 1);
 
-                C::finalize(curr.deref());
+                C::finalize(curr_shield.deref());
                 curr = succ;
+                curr_shield.defend(curr).unwrap();
             }
         }
     }
@@ -234,7 +238,14 @@ impl<'g, T: 'g, C: IsElement<T>> Iterator for Iter<'g, T, C> {
     type Item = Result<&'g T, IterError>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        while let Some(c) = unsafe { self.curr.as_ref() } {
+        let mut curr_shield = self.guard.shield(Shared::null()).unwrap();
+
+        loop {
+            if let Err(_) = curr_shield.defend(self.curr) {
+                return Some(Err(IterError::Stalled)); // TODO
+            }
+
+            let c = unsafe { curr_shield.as_ref() }?; // if None, we reached the end of the list.
             let succ = c.next.load(Acquire, self.guard);
 
             if succ.tag() == 1 {
@@ -256,8 +267,8 @@ impl<'g, T: 'g, C: IsElement<T>> Iterator for Iter<'g, T, C> {
                         // schedule deallocation. Deferred drop is okay, because `list.delete()`
                         // can only be called if `T: 'static`.
                         unsafe {
-                            let p = self.curr;
-                            self.guard.defer_unchecked(move || C::finalize(p.deref()));
+                            let p = curr_shield.deref();
+                            self.guard.defer_unchecked(move || C::finalize(p));
                         }
 
                         // Move over the removed by only advancing `curr`, not `pred`.
@@ -281,9 +292,6 @@ impl<'g, T: 'g, C: IsElement<T>> Iterator for Iter<'g, T, C> {
 
             return Some(Ok(unsafe { C::element_of(c) }));
         }
-
-        // We reached the end of the list.
-        None
     }
 }
 

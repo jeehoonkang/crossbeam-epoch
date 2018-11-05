@@ -3,7 +3,7 @@ use core::ptr;
 use core::mem;
 use core::marker::PhantomData;
 
-use atomic::Shared;
+use atomic::{Shared, Pointer};
 use collector::Collector;
 use deferred::Deferred;
 use internal::Local;
@@ -83,12 +83,14 @@ pub struct Guard {
 
 impl Guard {
     /// TODO
-    pub fn shield<'g, T>(&self) -> Result<Shield<'g, T>, ShieldError> {
+    pub fn shield<'g, T>(&self, ptr: Shared<'g, T>) -> Result<Shield<'g, T>, ShieldError> {
         if let Some(local) = unsafe { self.local.as_ref() } {
-            local.acquire_shield()
+            let mut shield = local.acquire_shield();
+            shield.defend(ptr)?;
+            Ok(shield)
         } else {
             Ok(Shield {
-                data: 0,
+                data: ptr.into_usize(),
                 local: ptr::null(),
                 index: 0,
                 _marker: PhantomData,

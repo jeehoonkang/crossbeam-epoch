@@ -10,7 +10,7 @@ use tag::*;
 /// TODO
 #[derive(Debug)]
 pub enum ShieldError {
-    OutOfSlots,
+    /// TODO
     Ejected,
 }
 
@@ -79,12 +79,72 @@ impl<'g, T> Shield<'g, T> {
         raw
     }
 
-    /// TODO
+    /// TODO: Dereferences the pointer.
+    ///
+    /// Returns a reference to the pointee that is valid during the lifetime `'g`.
+    ///
+    /// # Safety
+    ///
+    /// Dereferencing a pointer is unsafe because it could be pointing to invalid memory.
+    ///
+    /// Another concern is the possiblity of data races due to lack of proper synchronization.
+    /// For example, consider the following scenario:
+    ///
+    /// 1. A thread creates a new object: `a.store(Owned::new(10), Relaxed)`
+    /// 2. Another thread reads it: `*a.load(Relaxed, guard).as_ref().unwrap()`
+    ///
+    /// The problem is that relaxed orderings don't synchronize initialization of the object with
+    /// the read from the second thread. This is a data race. A possible solution would be to use
+    /// `Release` and `Acquire` orderings.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use crossbeam_epoch::{self as epoch, Atomic};
+    /// use std::sync::atomic::Ordering::SeqCst;
+    ///
+    /// let a = Atomic::new(1234);
+    /// let guard = &epoch::pin();
+    /// let p = a.load(SeqCst, guard);
+    /// unsafe {
+    ///     assert_eq!(p.deref(), &1234);
+    /// }
+    /// ```
     pub unsafe fn deref(&self) -> &'g T {
         &*self.as_raw()
     }
 
-    /// TODO
+    /// TODO: Converts the pointer to a reference.
+    ///
+    /// Returns `None` if the pointer is null, or else a reference to the object wrapped in `Some`.
+    ///
+    /// # Safety
+    ///
+    /// Dereferencing a pointer is unsafe because it could be pointing to invalid memory.
+    ///
+    /// Another concern is the possiblity of data races due to lack of proper synchronization.
+    /// For example, consider the following scenario:
+    ///
+    /// 1. A thread creates a new object: `a.store(Owned::new(10), Relaxed)`
+    /// 2. Another thread reads it: `*a.load(Relaxed, guard).as_ref().unwrap()`
+    ///
+    /// The problem is that relaxed orderings don't synchronize initialization of the object with
+    /// the read from the second thread. This is a data race. A possible solution would be to use
+    /// `Release` and `Acquire` orderings.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use crossbeam_epoch::{self as epoch, Atomic};
+    /// use std::sync::atomic::Ordering::SeqCst;
+    ///
+    /// let a = Atomic::new(1234);
+    /// let guard = &epoch::pin();
+    /// let p = a.load(SeqCst, guard);
+    /// unsafe {
+    ///     assert_eq!(p.as_ref(), Some(&1234));
+    /// }
+    /// ```
     pub unsafe fn as_ref(&self) -> Option<&'g T> {
         self.as_raw().as_ref()
     }
@@ -174,7 +234,7 @@ impl ShieldSet {
 
     /// Acquires a pointer slot.
     #[inline]
-    pub fn acquire<T>(&self) -> Result<usize, ShieldError> {
+    pub fn acquire<T>(&self) -> usize {
         for index1 in 0..Self::SIZE_IN_WORDS {
             let indexes2 = self.valid_bits[index1].load(Ordering::Relaxed);
             let index2 = indexes2.trailing_zeros() as usize;
@@ -182,11 +242,11 @@ impl ShieldSet {
             if index2 < Self::WORD_SIZE {
                 self.valid_bits[index1].store(indexes2 | (1 << index2), Ordering::Relaxed);
                 let index = index1 * Self::WORD_SIZE + index2;
-                return Ok(index);
+                return index;
             }
         }
 
-        Err(ShieldError::OutOfSlots)
+        panic!("ShieldSet::acquire(): out of slots");
     }
 
     /// Releases a pointer slot.

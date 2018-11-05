@@ -63,20 +63,23 @@ impl<T> Queue<T> {
     /// Attempts to atomically place `n` into the `next` pointer of `onto`, and returns `true` on
     /// success. The queue's `tail` pointer may be updated.
     #[inline(always)]
-    fn push_internal(&self, onto: Shared<Node<T>>, new: Shared<Node<T>>, guard: &Guard) -> bool {
+    fn push_internal(&self, onto: Shared<Node<T>>, new: Shared<Node<T>>, guard: &Guard) -> Result<(), ()> {
         // is `onto` the actual tail?
-        let o = unsafe { onto.deref() };
+        let onto_shield = guard.shield(onto).map_err(|_| ())?;
+        let o = unsafe { onto_shield.deref() };
         let next = o.next.load(Acquire, guard);
-        if unsafe { next.as_ref().is_some() } {
+        let next_shield = guard.shield(next).map_err(|_| ())?;
+        if unsafe { next_shield.as_ref().is_some() } {
             // if not, try to "help" by moving the tail pointer forward
             let _ = self.tail.compare_and_set(onto, next, Release, guard);
-            false
+            Err(())
         } else {
             // looks like the actual tail; attempt to link in `n`
             let result = o.next
                 .compare_and_set(Shared::null(), new, Release, guard)
-                .is_ok();
-            if result {
+                .map(|_| ())
+                .map_err(|_| ());
+            if result.is_ok() {
                 // try to move the tail pointer forward
                 let _ = self.tail.compare_and_set(onto, new, Release, guard);
             }
@@ -97,7 +100,7 @@ impl<T> Queue<T> {
             let tail = self.tail.load(Acquire, guard);
 
             // Attempt to push onto the `tail` snapshot; fails if `tail.next` has changed.
-            if self.push_internal(tail, new, guard) {
+            if self.push_internal(tail, new, guard).is_ok() {
                 break;
             }
         }
@@ -107,9 +110,12 @@ impl<T> Queue<T> {
     #[inline(always)]
     fn pop_internal(&self, guard: &Guard) -> Result<Option<T>, ()> {
         let head = self.head.load(Acquire, guard);
-        let h = unsafe { head.deref() };
+        let head_shield = guard.shield(head).map_err(|_| ())?;
+        let h = unsafe { head_shield.deref() };
         let next = h.next.load(Acquire, guard);
-        match unsafe { next.as_ref() } {
+        let next_shield = guard.shield(next).map_err(|_| ())?;
+        let n = unsafe { next_shield.as_ref() };
+        match n {
             Some(n) => unsafe {
                 self.head
                     .compare_and_set(head, next, Release, guard)
@@ -132,9 +138,12 @@ impl<T> Queue<T> {
         F: Fn(&T) -> bool,
     {
         let head = self.head.load(Acquire, guard);
-        let h = unsafe { head.deref() };
+        let head_shield = guard.shield(head).map_err(|_| ())?;
+        let h = unsafe { head_shield.deref() };
         let next = h.next.load(Acquire, guard);
-        match unsafe { next.as_ref() } {
+        let next_shield = guard.shield(next).map_err(|_| ())?;
+        let n = unsafe { next_shield.as_ref() };
+        match n {
             Some(n) if condition(&n.data) => unsafe {
                 self.head
                     .compare_and_set(head, next, Release, guard)
